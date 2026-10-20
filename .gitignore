@@ -1,0 +1,17 @@
+
+# Ambiente virtual Python
+.venv/
+
+# Cache e arquivos temporários
+__pycache__/
+*.py[cod]
+
+# Configurações locais do editor
+.vscode/
+
+# Arquivos de ambiente e segredos
+.env
+.env.*
+
+# Arquivos de vídeo gerados localmente
+replays/
