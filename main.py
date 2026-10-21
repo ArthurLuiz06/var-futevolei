@@ -9,12 +9,20 @@ from datetime import datetime
 from pathlib import Path
 
 
+# =========================================================
+# CONFIGURAÇÕES
+# =========================================================
+
 DURACAO_BUFFER = 30
 QUALIDADE_JPEG = 80
 FPS_REPLAY = 30
 
 PASTA_REPLAYS = Path(__file__).resolve().parent / "replays"
 
+
+# =========================================================
+# CAPTURA DA WEBCAM E BUFFER CONTÍNUO
+# =========================================================
 
 class CapturaWebcam:
     def __init__(self, indice_camera=0):
@@ -24,7 +32,7 @@ class CapturaWebcam:
         self.frame_atual = None
         self.lock_frame = threading.Lock()
 
-        # Cada item: (instante, imagem JPEG comprimida).
+        # Cada item contém: (instante, imagem JPEG).
         self.buffer = deque()
         self.lock_buffer = threading.Lock()
 
@@ -48,8 +56,8 @@ class CapturaWebcam:
             target=self._capturar,
             daemon=True,
         )
-        self.thread.start()
 
+        self.thread.start()
         return True
 
     def _capturar(self):
@@ -58,10 +66,11 @@ class CapturaWebcam:
                 sucesso, frame = self.camera.read()
 
                 if not sucesso:
-                    self.erro = (
-                        "Falha ao capturar imagem da webcam."
-                    )
-                    time.sleep(0.02)
+                    if self.ativa:
+                        self.erro = (
+                            "Falha ao capturar imagem da webcam."
+                        )
+                        time.sleep(0.02)
                     continue
 
                 instante = time.monotonic()
@@ -77,9 +86,11 @@ class CapturaWebcam:
 
                 dados_jpeg = imagem_jpeg.tobytes()
 
+                # Atualiza o último quadro disponível.
                 with self.lock_frame:
                     self.frame_atual = dados_jpeg
 
+                # Atualiza o buffer circular de 30 segundos.
                 with self.lock_buffer:
                     self.buffer.append((instante, dados_jpeg))
                     self.total_bytes_buffer += len(dados_jpeg)
@@ -112,7 +123,7 @@ class CapturaWebcam:
         )
 
     def obter_replay(self):
-        """Retorna uma cópia do buffer para reprodução ou gravação."""
+        """Obtém uma cópia independente do buffer atual."""
         with self.lock_buffer:
             return list(self.buffer)
 
@@ -141,66 +152,29 @@ class CapturaWebcam:
             self.camera = None
 
 
+# =========================================================
+# DECODIFICAÇÃO DOS QUADROS
+# =========================================================
+
 def decodificar_frame(frame_jpeg):
-    """Converte os bytes JPEG em uma imagem OpenCV."""
+    """Converte uma imagem JPEG em um quadro OpenCV."""
     return cv2.imdecode(
         np.frombuffer(frame_jpeg, dtype=np.uint8),
         cv2.IMREAD_COLOR,
     )
 
 
-def mostrar_replay(nome_janela, clipe):
-    """Reproduz manualmente um clipe do buffer."""
-    if not clipe:
-        print("Nenhum frame disponível para replay.")
-        return True
-
-    intervalo = 1 / FPS_REPLAY
-
-    for instante, frame_jpeg in clipe:
-        frame = decodificar_frame(frame_jpeg)
-
-        if frame is None:
-            continue
-
-        cv2.rectangle(
-            frame,
-            (0, 0),
-            (frame.shape[1], 50),
-            (25, 25, 25),
-            -1,
-        )
-
-        cv2.putText(
-            frame,
-            "REPLAY | R: voltar ao vivo | ESC: sair",
-            (15, 32),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 165, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        cv2.imshow(nome_janela, frame)
-
-        tecla = cv2.waitKey(
-            max(1, int(intervalo * 1000))
-        ) & 0xFF
-
-        if tecla in (ord("r"), ord("R")):
-            print("Retornando ao vídeo ao vivo...")
-            return True
-
-        if tecla == 27:
-            return False
-
-    print("Replay finalizado. Retornando ao vídeo ao vivo.")
-    return True
-
+# =========================================================
+# SALVAMENTO DO REPLAY EM MP4
+# =========================================================
 
 def salvar_replay_mp4(clipe):
-    """Salva o conteúdo do buffer em um arquivo MP4."""
+    """
+    Salva os quadros recebidos em MP4.
+
+    Esta função será executada em uma thread separada,
+    sem bloquear o loop de exibição da webcam.
+    """
     if not clipe:
         print("Não há imagens disponíveis para salvar.")
         return False
@@ -216,7 +190,7 @@ def salvar_replay_mp4(clipe):
             break
 
     if primeiro_frame is None:
-        print("Não foi possível decodificar os frames do replay.")
+        print("Não foi possível decodificar os quadros do replay.")
         return False
 
     altura, largura = primeiro_frame.shape[:2]
@@ -248,7 +222,7 @@ def salvar_replay_mp4(clipe):
     erro_gravacao = None
 
     try:
-        for instante, frame_jpeg in clipe:
+        for _, frame_jpeg in clipe:
             frame = decodificar_frame(frame_jpeg)
 
             if frame is None:
@@ -260,7 +234,7 @@ def salvar_replay_mp4(clipe):
             ):
                 frame = cv2.resize(frame, (largura, altura))
 
-            # Grava apenas a imagem da câmera, sem a interface.
+            # Grava somente o vídeo da câmera, sem a interface.
             gravador.write(frame)
             quadros_salvos += 1
 
@@ -285,7 +259,7 @@ def salvar_replay_mp4(clipe):
         print("O arquivo MP4 não foi criado corretamente.")
         return False
 
-    print("Replay salvo com sucesso!")
+    print("\nReplay salvo com sucesso!")
     print(f"Arquivo: {caminho_arquivo}")
     print(f"Quadros salvos: {quadros_salvos}")
     print(
@@ -296,8 +270,81 @@ def salvar_replay_mp4(clipe):
     return True
 
 
+# =========================================================
+# GERENCIADOR DE SALVAMENTO EM SEGUNDO PLANO
+# =========================================================
+
+class SalvadorReplay:
+    def __init__(self):
+        self.thread = None
+        self.lock = threading.Lock()
+        self.em_andamento = False
+
+    def iniciar(self, clipe):
+        """
+        Inicia a gravação em segundo plano.
+
+        Impede que dois salvamentos sejam iniciados
+        simultaneamente.
+        """
+        if not clipe:
+            print("O buffer ainda não possui quadros para salvar.")
+            return False
+
+        with self.lock:
+            if self.em_andamento:
+                print(
+                    "Aguarde: já existe um replay sendo salvo."
+                )
+                return False
+
+            self.em_andamento = True
+
+            self.thread = threading.Thread(
+                target=self._executar_salvamento,
+                args=(clipe,),
+                daemon=False,
+            )
+
+            self.thread.start()
+
+        print(
+            "Solicitação recebida! "
+            "O vídeo ao vivo continuará funcionando."
+        )
+
+        return True
+
+    def _executar_salvamento(self, clipe):
+        try:
+            salvar_replay_mp4(clipe)
+
+        except Exception as erro:
+            print(f"Erro inesperado ao salvar replay: {erro}")
+
+        finally:
+            with self.lock:
+                self.em_andamento = False
+
+    def aguardar(self):
+        """
+        Aguarda a conclusão do salvamento antes de encerrar
+        completamente o programa.
+        """
+        thread = self.thread
+
+        if thread is not None and thread.is_alive():
+            print("Aguardando a conclusão do salvamento...")
+            thread.join()
+
+
+# =========================================================
+# PROGRAMA PRINCIPAL
+# =========================================================
+
 def main():
     captura = CapturaWebcam(indice_camera=0)
+    salvador = SalvadorReplay()
 
     if not captura.iniciar():
         print(captura.erro)
@@ -308,11 +355,13 @@ def main():
     cv2.namedWindow(nome_janela, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(nome_janela, 1100, 650)
 
-    print("VAR Futevolei iniciado.")
-    print("Aguarde o buffer acumular alguns segundos.")
-    print("ESPACO: salvar os últimos segundos em MP4.")
-    print("R: voltar ao vivo durante um replay manual.")
-    print("ESC: encerrar.")
+    print("\n" + "=" * 48)
+    print("VAR FUTEVOLEI INICIADO")
+    print("=" * 48)
+    print("Aguarde o buffer acumular os primeiros segundos.")
+    print("ESPACO: salvar os últimos 30 segundos em MP4.")
+    print("ESC: encerrar o programa.")
+    print("=" * 48 + "\n")
 
     executando = True
 
@@ -341,6 +390,7 @@ def main():
 
             tela = frame.copy()
 
+            # Barra superior de status.
             cv2.rectangle(
                 tela,
                 (0, 0),
@@ -360,6 +410,33 @@ def main():
                 cv2.LINE_AA,
             )
 
+            # Indicador visual de salvamento em andamento.
+            if salvador.em_andamento:
+                texto_salvamento = "SALVANDO REPLAY..."
+
+                tamanho_texto = cv2.getTextSize(
+                    texto_salvamento,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    2,
+                )[0]
+
+                posicao_x = max(
+                    15,
+                    tela.shape[1] - tamanho_texto[0] - 20,
+                )
+
+                cv2.putText(
+                    tela,
+                    texto_salvamento,
+                    (posicao_x, 75),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 165, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
             cv2.imshow(nome_janela, tela)
 
             tecla = cv2.waitKey(1) & 0xFF
@@ -368,17 +445,24 @@ def main():
                 executando = False
 
             elif tecla == 32:
-                # Salva o buffer sem iniciar a reprodução.
+                # Copia o buffer neste instante.
+                # A gravação ocorrerá em outra thread.
                 clipe = captura.obter_replay()
-                salvar_replay_mp4(clipe)
+                salvador.iniciar(clipe)
 
     except KeyboardInterrupt:
-        print("Encerrando o programa...")
+        print("\nEncerrando o programa...")
 
     finally:
+        # Interrompe a captura da webcam.
         captura.parar()
+
+        # Garante que um MP4 em andamento termine de ser salvo.
+        salvador.aguardar()
+
         cv2.destroyAllWindows()
-        print("VAR encerrado.")
+
+        print("VAR Futevolei encerrado.")
 
 
 if __name__ == "__main__":
