@@ -3,6 +3,9 @@ import cv2
 import threading
 import time
 import numpy as np
+import os
+import sys
+import subprocess
 
 from collections import deque
 from datetime import datetime
@@ -32,7 +35,7 @@ class CapturaWebcam:
         self.frame_atual = None
         self.lock_frame = threading.Lock()
 
-        # Cada item contém: (instante, imagem JPEG).
+        # Cada item: (instante, imagem JPEG).
         self.buffer = deque()
         self.lock_buffer = threading.Lock()
 
@@ -86,11 +89,9 @@ class CapturaWebcam:
 
                 dados_jpeg = imagem_jpeg.tobytes()
 
-                # Atualiza o último quadro disponível.
                 with self.lock_frame:
                     self.frame_atual = dados_jpeg
 
-                # Atualiza o buffer circular de 30 segundos.
                 with self.lock_buffer:
                     self.buffer.append((instante, dados_jpeg))
                     self.total_bytes_buffer += len(dados_jpeg)
@@ -123,7 +124,7 @@ class CapturaWebcam:
         )
 
     def obter_replay(self):
-        """Obtém uma cópia independente do buffer atual."""
+        """Retorna uma cópia do buffer atual."""
         with self.lock_buffer:
             return list(self.buffer)
 
@@ -157,7 +158,7 @@ class CapturaWebcam:
 # =========================================================
 
 def decodificar_frame(frame_jpeg):
-    """Converte uma imagem JPEG em um quadro OpenCV."""
+    """Converte bytes JPEG em uma imagem OpenCV."""
     return cv2.imdecode(
         np.frombuffer(frame_jpeg, dtype=np.uint8),
         cv2.IMREAD_COLOR,
@@ -165,16 +166,48 @@ def decodificar_frame(frame_jpeg):
 
 
 # =========================================================
+# ABRIR VÍDEO NO REPRODUTOR PADRÃO
+# =========================================================
+
+def abrir_video(caminho_arquivo):
+    """
+    Abre o vídeo no aplicativo padrão do sistema operacional.
+    O arquivo permanece salvo na pasta replays.
+    """
+    try:
+        caminho_arquivo = Path(caminho_arquivo).resolve()
+
+        if not caminho_arquivo.exists():
+            print("Não foi possível encontrar o vídeo para abrir.")
+            return False
+
+        if sys.platform == "win32":
+            # Windows: abre no reprodutor associado a arquivos MP4.
+            os.startfile(str(caminho_arquivo))
+
+        elif sys.platform == "darwin":
+            # macOS.
+            subprocess.Popen(["open", str(caminho_arquivo)])
+
+        else:
+            # Linux.
+            subprocess.Popen(["xdg-open", str(caminho_arquivo)])
+
+        print("Replay aberto no reprodutor padrão.")
+        return True
+
+    except Exception as erro:
+        print(f"Não foi possível abrir o replay automaticamente: {erro}")
+        print(f"Você pode abrir o arquivo manualmente: {caminho_arquivo}")
+        return False
+
+
+# =========================================================
 # SALVAMENTO DO REPLAY EM MP4
 # =========================================================
 
 def salvar_replay_mp4(clipe):
-    """
-    Salva os quadros recebidos em MP4.
-
-    Esta função será executada em uma thread separada,
-    sem bloquear o loop de exibição da webcam.
-    """
+    """Salva o buffer em MP4 e abre o arquivo após concluir."""
     if not clipe:
         print("Não há imagens disponíveis para salvar.")
         return False
@@ -242,6 +275,7 @@ def salvar_replay_mp4(clipe):
         erro_gravacao = erro
 
     finally:
+        # Fecha o arquivo antes de tentar abri-lo.
         gravador.release()
 
     if erro_gravacao is not None:
@@ -259,13 +293,19 @@ def salvar_replay_mp4(clipe):
         print("O arquivo MP4 não foi criado corretamente.")
         return False
 
-    print("\nReplay salvo com sucesso!")
+    print("\n" + "=" * 48)
+    print("REPLAY SALVO COM SUCESSO!")
+    print("=" * 48)
     print(f"Arquivo: {caminho_arquivo}")
     print(f"Quadros salvos: {quadros_salvos}")
     print(
         f"Tamanho: "
         f"{caminho_arquivo.stat().st_size / (1024 * 1024):.2f} MB"
     )
+    print("=" * 48)
+
+    # Só abre o vídeo depois de finalizar a gravação.
+    abrir_video(caminho_arquivo)
 
     return True
 
@@ -281,12 +321,7 @@ class SalvadorReplay:
         self.em_andamento = False
 
     def iniciar(self, clipe):
-        """
-        Inicia a gravação em segundo plano.
-
-        Impede que dois salvamentos sejam iniciados
-        simultaneamente.
-        """
+        """Inicia a gravação em uma thread separada."""
         if not clipe:
             print("O buffer ainda não possui quadros para salvar.")
             return False
@@ -294,19 +329,25 @@ class SalvadorReplay:
         with self.lock:
             if self.em_andamento:
                 print(
-                    "Aguarde: já existe um replay sendo salvo."
+                    "Já existe um replay sendo salvo. "
+                    "Aguarde a conclusão."
                 )
                 return False
 
             self.em_andamento = True
 
-            self.thread = threading.Thread(
-                target=self._executar_salvamento,
-                args=(clipe,),
-                daemon=False,
-            )
+            try:
+                self.thread = threading.Thread(
+                    target=self._executar_salvamento,
+                    args=(clipe,),
+                    daemon=False,
+                )
 
-            self.thread.start()
+                self.thread.start()
+
+            except Exception:
+                self.em_andamento = False
+                raise
 
         print(
             "Solicitação recebida! "
@@ -326,12 +367,14 @@ class SalvadorReplay:
             with self.lock:
                 self.em_andamento = False
 
+    def esta_salvando(self):
+        with self.lock:
+            return self.em_andamento
+
     def aguardar(self):
-        """
-        Aguarda a conclusão do salvamento antes de encerrar
-        completamente o programa.
-        """
-        thread = self.thread
+        """Aguarda a conclusão do salvamento antes de encerrar."""
+        with self.lock:
+            thread = self.thread
 
         if thread is not None and thread.is_alive():
             print("Aguardando a conclusão do salvamento...")
@@ -359,7 +402,7 @@ def main():
     print("VAR FUTEVOLEI INICIADO")
     print("=" * 48)
     print("Aguarde o buffer acumular os primeiros segundos.")
-    print("ESPACO: salvar os últimos 30 segundos em MP4.")
+    print("ESPACO: salvar e abrir os últimos 30 segundos.")
     print("ESC: encerrar o programa.")
     print("=" * 48 + "\n")
 
@@ -390,7 +433,7 @@ def main():
 
             tela = frame.copy()
 
-            # Barra superior de status.
+            # Barra superior com o status.
             cv2.rectangle(
                 tela,
                 (0, 0),
@@ -410,8 +453,8 @@ def main():
                 cv2.LINE_AA,
             )
 
-            # Indicador visual de salvamento em andamento.
-            if salvador.em_andamento:
+            # Indicador visual enquanto o MP4 é gerado.
+            if salvador.esta_salvando():
                 texto_salvamento = "SALVANDO REPLAY..."
 
                 tamanho_texto = cv2.getTextSize(
@@ -445,8 +488,8 @@ def main():
                 executando = False
 
             elif tecla == 32:
-                # Copia o buffer neste instante.
-                # A gravação ocorrerá em outra thread.
+                # Captura o conteúdo atual do buffer.
+                # O salvamento e a abertura acontecem em segundo plano.
                 clipe = captura.obter_replay()
                 salvador.iniciar(clipe)
 
@@ -454,10 +497,9 @@ def main():
         print("\nEncerrando o programa...")
 
     finally:
-        # Interrompe a captura da webcam.
         captura.parar()
 
-        # Garante que um MP4 em andamento termine de ser salvo.
+        # Evita encerrar o programa antes de concluir um MP4.
         salvador.aguardar()
 
         cv2.destroyAllWindows()
