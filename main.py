@@ -2,6 +2,7 @@
 import cv2
 import threading
 import time
+import math
 import numpy as np
 
 from collections import deque
@@ -56,8 +57,8 @@ class CapturaWebcam:
             target=self._capturar,
             daemon=True,
         )
-        self.thread.start()
 
+        self.thread.start()
         return True
 
     def _capturar(self):
@@ -67,10 +68,9 @@ class CapturaWebcam:
 
                 if not sucesso:
                     if self.ativa:
-                        self.erro = (
-                            "Falha ao capturar imagem da webcam."
-                        )
+                        self.erro = "Falha ao capturar imagem da webcam."
                         time.sleep(0.02)
+
                     continue
 
                 instante = time.monotonic()
@@ -168,7 +168,6 @@ def decodificar_frame(frame_jpeg):
 
 def salvar_replay_mp4(clipe):
     """Salva o buffer em MP4 e retorna o caminho do arquivo criado."""
-
     if not clipe:
         print("Não há imagens disponíveis para salvar.")
         return None
@@ -236,7 +235,6 @@ def salvar_replay_mp4(clipe):
         erro_gravacao = erro
 
     finally:
-        # Fecha o arquivo antes de tentar abri-lo.
         gravador.release()
 
     if erro_gravacao is not None:
@@ -282,7 +280,6 @@ class SalvadorReplay:
 
     def iniciar(self, clipe):
         """Inicia a gravação em uma thread separada."""
-
         if not clipe:
             print("O buffer ainda não possui quadros para salvar.")
             return False
@@ -337,16 +334,13 @@ class SalvadorReplay:
 
     def obter_replay_pronto(self):
         """Entrega o replay recém-salvo uma única vez."""
-
         with self.lock:
             caminho = self.replay_pronto
             self.replay_pronto = None
-
             return caminho
 
     def aguardar(self):
         """Aguarda a conclusão do salvamento antes de encerrar."""
-
         with self.lock:
             thread = self.thread
 
@@ -356,23 +350,64 @@ class SalvadorReplay:
 
 
 # =========================================================
+# FUNÇÕES AUXILIARES DA INTERFACE DO REPLAY
+# =========================================================
+
+def desenhar_texto_legivel(
+    imagem,
+    texto,
+    posicao,
+    escala=0.42,
+    cor=(255, 255, 255),
+):
+    """Desenha texto com contorno para facilitar a leitura."""
+    cv2.putText(
+        imagem,
+        texto,
+        posicao,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        escala,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        imagem,
+        texto,
+        posicao,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        escala,
+        cor,
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def formatar_tempo(segundos):
+    segundos = max(0, int(segundos))
+
+    minutos = segundos // 60
+    segundos_restantes = segundos % 60
+
+    return f"{minutos:02d}:{segundos_restantes:02d}"
+
+
+# =========================================================
 # VISUALIZADOR DE REPLAY
-# CÂMERA LENTA E QUADRO A QUADRO
 # =========================================================
 
 def visualizar_replay(caminho_arquivo):
     """
-    Abre o replay salvo em uma janela própria.
-
-    CONTROLES:
-    ESPAÇO: pausar ou continuar
-    1: câmera lenta 0,25x
-    2: câmera lenta 0,5x
-    3: velocidade normal 1x
-    4: velocidade rápida 2x
-    A: voltar um quadro
-    D: avançar um quadro
-    Q ou ESC: fechar o replay e voltar ao vivo
+    Visualizador com:
+    - Barra de progresso clicável.
+    - Tempo atual e restante.
+    - Câmera lenta e câmera acelerada.
+    - Navegação quadro a quadro.
+    - Reinício do replay.
+    - Temporização baseada no relógio monotônico.
+    - Compensação de atrasos durante a reprodução.
+    - Interface sem instruções sobrepostas ao vídeo.
     """
 
     captura_replay = cv2.VideoCapture(str(caminho_arquivo))
@@ -391,38 +426,146 @@ def visualizar_replay(caminho_arquivo):
     if not fps_arquivo or fps_arquivo <= 0:
         fps_arquivo = FPS_REPLAY
 
+    duracao_total = (
+        total_quadros / fps_arquivo
+        if total_quadros > 0
+        else 0.0
+    )
+
     indice_quadro = 0
     velocidade = 1.0
     pausado = False
     quadro_atual = None
 
+    # Relógio usado para manter o ritmo da reprodução.
+    proximo_instante_frame = time.perf_counter()
+
     nome_janela = "VAR Futevolei - Revisao do Replay"
 
-    cv2.namedWindow(nome_janela, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(nome_janela, 1100, 650)
+    estado_mouse = {
+        "solicitar_quadro": None
+    }
 
-    print("\n" + "=" * 54)
+    def ao_clicar_mouse(evento, x, y, flags, parametro):
+        if evento != cv2.EVENT_LBUTTONDOWN:
+            return
+
+        largura_janela = parametro["largura"]
+        altura_janela = parametro["altura"]
+
+        y_barra = altura_janela - 34
+        x_inicio = 20
+        x_fim = max(x_inicio + 1, largura_janela - 20)
+
+        if (
+            y_barra - 12 <= y <= y_barra + 12
+            and x_inicio <= x <= x_fim
+        ):
+            proporcao = (
+                (x - x_inicio) / (x_fim - x_inicio)
+            )
+
+            alvo = int(
+                proporcao * max(total_quadros - 1, 0)
+            )
+
+            estado_mouse["solicitar_quadro"] = alvo
+
+    cv2.namedWindow(
+        nome_janela,
+        cv2.WINDOW_NORMAL,
+    )
+
+    cv2.resizeWindow(
+        nome_janela,
+        1100,
+        650,
+    )
+
+    dimensoes_janela = {
+        "largura": 1100,
+        "altura": 650,
+    }
+
+    cv2.setMouseCallback(
+        nome_janela,
+        ao_clicar_mouse,
+        dimensoes_janela,
+    )
+
+    print("\n" + "=" * 48)
     print("VISUALIZADOR DE REPLAY")
-    print("ESPACO: pausar/continuar")
+    print("ESPAÇO: pausar/continuar")
     print("1: 0,25x | 2: 0,5x | 3: 1x | 4: 2x")
-    print("A: voltar quadro | D: avancar quadro")
-    print("Q ou ESC: fechar o replay")
-    print("=" * 54 + "\n")
+    print("A / seta esquerda: quadro anterior")
+    print("D / seta direita: próximo quadro")
+    print("R: reiniciar | clique na barra: buscar momento")
+    print("Q ou ESC: fechar replay e voltar ao ao vivo")
+    print("=" * 48 + "\n")
 
     try:
         while True:
+            inicio_ciclo = time.perf_counter()
 
-            # Carrega o próximo quadro quando estiver reproduzindo.
+            try:
+                retangulo = cv2.getWindowImageRect(nome_janela)
+
+                if (
+                    retangulo
+                    and retangulo[2] > 0
+                    and retangulo[3] > 0
+                ):
+                    dimensoes_janela["largura"] = retangulo[2]
+                    dimensoes_janela["altura"] = retangulo[3]
+
+            except (cv2.error, AttributeError):
+                pass
+
+            # -------------------------------------------------
+            # BUSCA PELO CLIQUE NA BARRA
+            # -------------------------------------------------
+
+            quadro_solicitado = estado_mouse["solicitar_quadro"]
+
+            if quadro_solicitado is not None:
+                indice_quadro = max(
+                    0,
+                    min(
+                        quadro_solicitado,
+                        max(total_quadros - 1, 0),
+                    ),
+                )
+
+                captura_replay.set(
+                    cv2.CAP_PROP_POS_FRAMES,
+                    indice_quadro,
+                )
+
+                sucesso, frame = captura_replay.read()
+
+                estado_mouse["solicitar_quadro"] = None
+                pausado = True
+
+                # Reinicia a referência temporal após a busca.
+                proximo_instante_frame = time.perf_counter()
+
+                if sucesso:
+                    quadro_atual = frame
+                else:
+                    continue
+
+            # -------------------------------------------------
+            # LEITURA DO PRÓXIMO QUADRO
+            # -------------------------------------------------
+
             if not pausado or quadro_atual is None:
                 sucesso, frame = captura_replay.read()
 
                 if not sucesso:
-                    # Ao chegar ao fim, pausa no último quadro.
                     if total_quadros <= 0:
                         break
 
                     pausado = True
-
                     indice_quadro = max(0, total_quadros - 1)
 
                     captura_replay.set(
@@ -451,96 +594,279 @@ def visualizar_replay(caminho_arquivo):
 
             altura, largura = tela.shape[:2]
 
-            # Barra superior.
+            tempo_atual = (
+                indice_quadro / fps_arquivo
+                if fps_arquivo > 0
+                else 0.0
+            )
+
+            tempo_restante = max(
+                0.0,
+                duracao_total - tempo_atual,
+            )
+
+            # -------------------------------------------------
+            # STATUS SUPERIOR
+            # -------------------------------------------------
+
             cv2.rectangle(
                 tela,
                 (0, 0),
-                (largura, 44),
+                (largura, 48),
                 (25, 25, 25),
                 -1,
             )
 
-            estado = "PAUSADO" if pausado else "REPRODUZINDO"
+            estado_texto = (
+                "PAUSADO"
+                if pausado
+                else "REPRODUZINDO"
+            )
 
-            texto = (
-                f"{estado} | Velocidade: {velocidade:g}x | "
+            texto_status = (
+                f"{estado_texto} | {velocidade:g}x | "
+                f"Tempo: {formatar_tempo(tempo_atual)} / "
+                f"{formatar_tempo(duracao_total)} | "
                 f"Quadro: {indice_quadro + 1}/"
                 f"{max(total_quadros, 1)}"
             )
 
             cv2.putText(
                 tela,
-                texto,
-                (12, 29),
+                texto_status,
+                (12, 31),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.58,
                 (0, 255, 0),
                 2,
                 cv2.LINE_AA,
             )
 
-            # Barra inferior com os controles.
-            cv2.rectangle(
-                tela,
-                (0, max(44, altura - 38)),
-                (largura, altura),
-                (25, 25, 25),
-                -1,
+            # -------------------------------------------------
+            # BARRA DE PROGRESSO
+            # -------------------------------------------------
+
+            y_barra = max(55, altura - 34)
+
+            x_inicio = 20
+            x_fim = max(x_inicio + 1, largura - 20)
+
+            progresso = (
+                indice_quadro / max(total_quadros - 1, 1)
+                if total_quadros > 1
+                else 0.0
             )
 
-            ajuda = (
-                "ESPACO: pausa | 1: 0.25x | 2: 0.5x | "
-                "3: 1x | 4: 2x | A/D: quadro | Q/ESC: sair"
+            x_progresso = int(
+                x_inicio + progresso * (x_fim - x_inicio)
             )
 
-            cv2.putText(
+            cv2.line(
                 tela,
-                ajuda,
-                (12, altura - 13),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (255, 255, 255),
-                1,
+                (x_inicio, y_barra),
+                (x_fim, y_barra),
+                (190, 190, 190),
+                2,
                 cv2.LINE_AA,
+            )
+
+            cv2.line(
+                tela,
+                (x_inicio, y_barra),
+                (x_progresso, y_barra),
+                (0, 200, 255),
+                3,
+                cv2.LINE_AA,
+            )
+
+            cv2.circle(
+                tela,
+                (x_progresso, y_barra),
+                5,
+                (0, 0, 0),
+                -1,
+                cv2.LINE_AA,
+            )
+
+            cv2.circle(
+                tela,
+                (x_progresso, y_barra),
+                3,
+                (255, 255, 255),
+                -1,
+                cv2.LINE_AA,
+            )
+
+            # -------------------------------------------------
+            # TEMPO ATUAL E TEMPO RESTANTE
+            # -------------------------------------------------
+
+            texto_atual = formatar_tempo(tempo_atual)
+            texto_restante = f"-{formatar_tempo(tempo_restante)}"
+
+            escala_tempo = 0.42
+            y_tempo = altura - 8
+
+            desenhar_texto_legivel(
+                tela,
+                texto_atual,
+                (x_inicio, y_tempo),
+                escala=escala_tempo,
+            )
+
+            tamanho_restante = cv2.getTextSize(
+                texto_restante,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                escala_tempo,
+                1,
+            )[0]
+
+            x_tempo_restante = max(
+                x_inicio,
+                largura - tamanho_restante[0] - 20,
+            )
+
+            desenhar_texto_legivel(
+                tela,
+                texto_restante,
+                (x_tempo_restante, y_tempo),
+                escala=escala_tempo,
             )
 
             cv2.imshow(nome_janela, tela)
 
-            # A pausa não bloqueia indefinidamente a leitura de teclas.
+            # -------------------------------------------------
+            # TEMPORIZAÇÃO DA REPRODUÇÃO
+            # -------------------------------------------------
+            #
+            # O intervalo é calculado usando o FPS real do
+            # arquivo e a velocidade selecionada.
+            #
+            # Exemplo: 30 FPS em 2x = 60 quadros por segundo
+            # de reprodução, ou aproximadamente 16,67 ms
+            # entre quadros exibidos.
+            #
+            # O relógio monotônico evita que o tempo gasto
+            # renderizando a interface seja somado ao atraso
+            # de cada quadro.
+            # -------------------------------------------------
+
             if pausado:
-                atraso_ms = 30
+                tecla = cv2.waitKeyEx(30)
+
+                # Não acumula atrasos enquanto estiver pausado.
+                proximo_instante_frame = time.perf_counter()
+
             else:
-                atraso_ms = max(
-                    1,
-                    int((1000 / fps_arquivo) / velocidade),
+                intervalo_frame = 1.0 / (
+                    fps_arquivo * velocidade
                 )
 
-            tecla = cv2.waitKey(atraso_ms) & 0xFF
+                proximo_instante_frame += intervalo_frame
+
+                agora = time.perf_counter()
+                tempo_espera = proximo_instante_frame - agora
+
+                if tempo_espera > 0:
+                    atraso_ms = max(
+                        1,
+                        int(math.ceil(tempo_espera * 1000)),
+                    )
+
+                    tecla = cv2.waitKeyEx(atraso_ms)
+
+                else:
+                    # Continua verificando os comandos sem
+                    # acrescentar um atraso artificial grande.
+                    tecla = cv2.waitKeyEx(1)
+
+                    # Se o processamento atrasou a reprodução,
+                    # pula quadros para recuperar o ritmo real.
+                    agora = time.perf_counter()
+                    atraso = agora - proximo_instante_frame
+
+                    if atraso >= intervalo_frame:
+                        quadros_pular = int(
+                            atraso / intervalo_frame
+                        )
+
+                        quadros_disponiveis = max(
+                            0,
+                            total_quadros - indice_quadro - 1,
+                        )
+
+                        quadros_pular = min(
+                            quadros_pular,
+                            quadros_disponiveis,
+                        )
+
+                        for _ in range(quadros_pular):
+                            if not captura_replay.grab():
+                                break
+
+                            indice_quadro += 1
+
+                            proximo_instante_frame += (
+                                intervalo_frame
+                            )
+
+            # -------------------------------------------------
+            # CONTROLES DO REPLAY
+            # -------------------------------------------------
 
             if tecla in (27, ord("q"), ord("Q")):
                 break
 
-            elif tecla == 32:
-                # Espaço: pausa ou continua.
+            elif tecla == 32:  # Espaço
                 pausado = not pausado
+                proximo_instante_frame = time.perf_counter()
 
             elif tecla == ord("1"):
                 velocidade = 0.25
+                proximo_instante_frame = time.perf_counter()
 
             elif tecla == ord("2"):
                 velocidade = 0.5
+                proximo_instante_frame = time.perf_counter()
 
             elif tecla == ord("3"):
                 velocidade = 1.0
+                proximo_instante_frame = time.perf_counter()
 
             elif tecla == ord("4"):
                 velocidade = 2.0
+                proximo_instante_frame = time.perf_counter()
 
-            elif tecla in (ord("a"), ord("A")):
-                # Volta um quadro e pausa.
+            elif tecla in (ord("r"), ord("R")):
+                # Reinicia desde o começo e volta a reproduzir.
+                indice_quadro = 0
+
+                captura_replay.set(
+                    cv2.CAP_PROP_POS_FRAMES,
+                    0,
+                )
+
+                sucesso, frame = captura_replay.read()
+
+                if sucesso:
+                    quadro_atual = frame
+
+                pausado = False
+                proximo_instante_frame = time.perf_counter()
+
+            elif tecla in (
+                ord("a"),
+                ord("A"),
+                2424832,
+                81,
+            ):
+                # Volta exatamente um quadro e pausa.
                 pausado = True
 
-                indice_quadro = max(0, indice_quadro - 1)
+                indice_quadro = max(
+                    0,
+                    indice_quadro - 1,
+                )
 
                 captura_replay.set(
                     cv2.CAP_PROP_POS_FRAMES,
@@ -552,8 +878,15 @@ def visualizar_replay(caminho_arquivo):
                 if sucesso:
                     quadro_atual = frame
 
-            elif tecla in (ord("d"), ord("D")):
-                # Avança um quadro e pausa.
+                proximo_instante_frame = time.perf_counter()
+
+            elif tecla in (
+                ord("d"),
+                ord("D"),
+                2555904,
+                83,
+            ):
+                # Avança exatamente um quadro e pausa.
                 pausado = True
 
                 indice_quadro = min(
@@ -571,7 +904,8 @@ def visualizar_replay(caminho_arquivo):
                 if sucesso:
                     quadro_atual = frame
 
-            # Detecta o fechamento pelo botão X.
+                proximo_instante_frame = time.perf_counter()
+
             try:
                 if (
                     cv2.getWindowProperty(
@@ -589,6 +923,7 @@ def visualizar_replay(caminho_arquivo):
 
         try:
             cv2.destroyWindow(nome_janela)
+
         except cv2.error:
             pass
 
@@ -607,8 +942,16 @@ def main():
 
     nome_janela = "VAR Futevolei"
 
-    cv2.namedWindow(nome_janela, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(nome_janela, 1100, 650)
+    cv2.namedWindow(
+        nome_janela,
+        cv2.WINDOW_NORMAL,
+    )
+
+    cv2.resizeWindow(
+        nome_janela,
+        1100,
+        650,
+    )
 
     print("\n" + "=" * 48)
     print("VAR FUTEVOLEI INICIADO")
@@ -622,8 +965,7 @@ def main():
 
     try:
         while executando:
-
-            # Abre o replay quando a gravação terminar.
+            # Abre automaticamente o replay após o salvamento.
             replay_pronto = salvador.obter_replay_pronto()
 
             if replay_pronto is not None:
@@ -653,7 +995,6 @@ def main():
 
             tela = frame.copy()
 
-            # Barra superior com o status.
             cv2.rectangle(
                 tela,
                 (0, 0),
@@ -673,7 +1014,6 @@ def main():
                 cv2.LINE_AA,
             )
 
-            # Indicador de salvamento.
             if salvador.esta_salvando():
                 texto_salvamento = "SALVANDO REPLAY..."
 
@@ -708,11 +1048,9 @@ def main():
                 executando = False
 
             elif tecla == 32:
-                # Copia o buffer e inicia o salvamento em segundo plano.
                 clipe = captura.obter_replay()
                 salvador.iniciar(clipe)
 
-            # Detecta o fechamento da janela ao vivo.
             try:
                 if (
                     cv2.getWindowProperty(
@@ -730,12 +1068,8 @@ def main():
 
     finally:
         captura.parar()
-
-        # Espera a gravação terminar antes de encerrar.
         salvador.aguardar()
-
         cv2.destroyAllWindows()
-
         print("VAR Futevolei encerrado.")
 
 
