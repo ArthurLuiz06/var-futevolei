@@ -3,9 +3,6 @@ import cv2
 import threading
 import time
 import numpy as np
-import os
-import sys
-import subprocess
 
 from collections import deque
 from datetime import datetime
@@ -59,8 +56,8 @@ class CapturaWebcam:
             target=self._capturar,
             daemon=True,
         )
-
         self.thread.start()
+
         return True
 
     def _capturar(self):
@@ -166,51 +163,15 @@ def decodificar_frame(frame_jpeg):
 
 
 # =========================================================
-# ABRIR VÍDEO NO REPRODUTOR PADRÃO
-# =========================================================
-
-def abrir_video(caminho_arquivo):
-    """
-    Abre o vídeo no aplicativo padrão do sistema operacional.
-    O arquivo permanece salvo na pasta replays.
-    """
-    try:
-        caminho_arquivo = Path(caminho_arquivo).resolve()
-
-        if not caminho_arquivo.exists():
-            print("Não foi possível encontrar o vídeo para abrir.")
-            return False
-
-        if sys.platform == "win32":
-            # Windows: abre no reprodutor associado a arquivos MP4.
-            os.startfile(str(caminho_arquivo))
-
-        elif sys.platform == "darwin":
-            # macOS.
-            subprocess.Popen(["open", str(caminho_arquivo)])
-
-        else:
-            # Linux.
-            subprocess.Popen(["xdg-open", str(caminho_arquivo)])
-
-        print("Replay aberto no reprodutor padrão.")
-        return True
-
-    except Exception as erro:
-        print(f"Não foi possível abrir o replay automaticamente: {erro}")
-        print(f"Você pode abrir o arquivo manualmente: {caminho_arquivo}")
-        return False
-
-
-# =========================================================
 # SALVAMENTO DO REPLAY EM MP4
 # =========================================================
 
 def salvar_replay_mp4(clipe):
-    """Salva o buffer em MP4 e abre o arquivo após concluir."""
+    """Salva o buffer em MP4 e retorna o caminho do arquivo criado."""
+
     if not clipe:
         print("Não há imagens disponíveis para salvar.")
-        return False
+        return None
 
     PASTA_REPLAYS.mkdir(parents=True, exist_ok=True)
 
@@ -224,7 +185,7 @@ def salvar_replay_mp4(clipe):
 
     if primeiro_frame is None:
         print("Não foi possível decodificar os quadros do replay.")
-        return False
+        return None
 
     altura, largura = primeiro_frame.shape[:2]
 
@@ -249,7 +210,7 @@ def salvar_replay_mp4(clipe):
         gravador.release()
         print("Não foi possível criar o arquivo MP4.")
         print("Verifique o suporte a vídeo do OpenCV.")
-        return False
+        return None
 
     quadros_salvos = 0
     erro_gravacao = None
@@ -280,18 +241,18 @@ def salvar_replay_mp4(clipe):
 
     if erro_gravacao is not None:
         print(f"Erro ao gravar o replay: {erro_gravacao}")
-        return False
+        return None
 
     if quadros_salvos == 0:
         print("Nenhum quadro foi salvo.")
-        return False
+        return None
 
     if (
         not caminho_arquivo.exists()
         or caminho_arquivo.stat().st_size == 0
     ):
         print("O arquivo MP4 não foi criado corretamente.")
-        return False
+        return None
 
     print("\n" + "=" * 48)
     print("REPLAY SALVO COM SUCESSO!")
@@ -302,12 +263,10 @@ def salvar_replay_mp4(clipe):
         f"Tamanho: "
         f"{caminho_arquivo.stat().st_size / (1024 * 1024):.2f} MB"
     )
+    print("O replay será aberto no visualizador do VAR.")
     print("=" * 48)
 
-    # Só abre o vídeo depois de finalizar a gravação.
-    abrir_video(caminho_arquivo)
-
-    return True
+    return caminho_arquivo
 
 
 # =========================================================
@@ -319,9 +278,11 @@ class SalvadorReplay:
         self.thread = None
         self.lock = threading.Lock()
         self.em_andamento = False
+        self.replay_pronto = None
 
     def iniciar(self, clipe):
         """Inicia a gravação em uma thread separada."""
+
         if not clipe:
             print("O buffer ainda não possui quadros para salvar.")
             return False
@@ -357,28 +318,279 @@ class SalvadorReplay:
         return True
 
     def _executar_salvamento(self, clipe):
+        caminho = None
+
         try:
-            salvar_replay_mp4(clipe)
+            caminho = salvar_replay_mp4(clipe)
 
         except Exception as erro:
             print(f"Erro inesperado ao salvar replay: {erro}")
 
         finally:
             with self.lock:
+                self.replay_pronto = caminho
                 self.em_andamento = False
 
     def esta_salvando(self):
         with self.lock:
             return self.em_andamento
 
+    def obter_replay_pronto(self):
+        """Entrega o replay recém-salvo uma única vez."""
+
+        with self.lock:
+            caminho = self.replay_pronto
+            self.replay_pronto = None
+
+            return caminho
+
     def aguardar(self):
         """Aguarda a conclusão do salvamento antes de encerrar."""
+
         with self.lock:
             thread = self.thread
 
         if thread is not None and thread.is_alive():
             print("Aguardando a conclusão do salvamento...")
             thread.join()
+
+
+# =========================================================
+# VISUALIZADOR DE REPLAY
+# CÂMERA LENTA E QUADRO A QUADRO
+# =========================================================
+
+def visualizar_replay(caminho_arquivo):
+    """
+    Abre o replay salvo em uma janela própria.
+
+    CONTROLES:
+    ESPAÇO: pausar ou continuar
+    1: câmera lenta 0,25x
+    2: câmera lenta 0,5x
+    3: velocidade normal 1x
+    4: velocidade rápida 2x
+    A: voltar um quadro
+    D: avançar um quadro
+    Q ou ESC: fechar o replay e voltar ao vivo
+    """
+
+    captura_replay = cv2.VideoCapture(str(caminho_arquivo))
+
+    if not captura_replay.isOpened():
+        print("Não foi possível abrir o replay no visualizador.")
+        captura_replay.release()
+        return
+
+    total_quadros = int(
+        captura_replay.get(cv2.CAP_PROP_FRAME_COUNT)
+    )
+
+    fps_arquivo = captura_replay.get(cv2.CAP_PROP_FPS)
+
+    if not fps_arquivo or fps_arquivo <= 0:
+        fps_arquivo = FPS_REPLAY
+
+    indice_quadro = 0
+    velocidade = 1.0
+    pausado = False
+    quadro_atual = None
+
+    nome_janela = "VAR Futevolei - Revisao do Replay"
+
+    cv2.namedWindow(nome_janela, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(nome_janela, 1100, 650)
+
+    print("\n" + "=" * 54)
+    print("VISUALIZADOR DE REPLAY")
+    print("ESPACO: pausar/continuar")
+    print("1: 0,25x | 2: 0,5x | 3: 1x | 4: 2x")
+    print("A: voltar quadro | D: avancar quadro")
+    print("Q ou ESC: fechar o replay")
+    print("=" * 54 + "\n")
+
+    try:
+        while True:
+
+            # Carrega o próximo quadro quando estiver reproduzindo.
+            if not pausado or quadro_atual is None:
+                sucesso, frame = captura_replay.read()
+
+                if not sucesso:
+                    # Ao chegar ao fim, pausa no último quadro.
+                    if total_quadros <= 0:
+                        break
+
+                    pausado = True
+
+                    indice_quadro = max(0, total_quadros - 1)
+
+                    captura_replay.set(
+                        cv2.CAP_PROP_POS_FRAMES,
+                        indice_quadro,
+                    )
+
+                    sucesso, frame = captura_replay.read()
+
+                    if not sucesso:
+                        break
+
+                else:
+                    indice_quadro = max(
+                        0,
+                        int(
+                            captura_replay.get(
+                                cv2.CAP_PROP_POS_FRAMES
+                            )
+                        ) - 1,
+                    )
+
+                quadro_atual = frame
+
+            tela = quadro_atual.copy()
+
+            altura, largura = tela.shape[:2]
+
+            # Barra superior.
+            cv2.rectangle(
+                tela,
+                (0, 0),
+                (largura, 44),
+                (25, 25, 25),
+                -1,
+            )
+
+            estado = "PAUSADO" if pausado else "REPRODUZINDO"
+
+            texto = (
+                f"{estado} | Velocidade: {velocidade:g}x | "
+                f"Quadro: {indice_quadro + 1}/"
+                f"{max(total_quadros, 1)}"
+            )
+
+            cv2.putText(
+                tela,
+                texto,
+                (12, 29),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+            # Barra inferior com os controles.
+            cv2.rectangle(
+                tela,
+                (0, max(44, altura - 38)),
+                (largura, altura),
+                (25, 25, 25),
+                -1,
+            )
+
+            ajuda = (
+                "ESPACO: pausa | 1: 0.25x | 2: 0.5x | "
+                "3: 1x | 4: 2x | A/D: quadro | Q/ESC: sair"
+            )
+
+            cv2.putText(
+                tela,
+                ajuda,
+                (12, altura - 13),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.imshow(nome_janela, tela)
+
+            # A pausa não bloqueia indefinidamente a leitura de teclas.
+            if pausado:
+                atraso_ms = 30
+            else:
+                atraso_ms = max(
+                    1,
+                    int((1000 / fps_arquivo) / velocidade),
+                )
+
+            tecla = cv2.waitKey(atraso_ms) & 0xFF
+
+            if tecla in (27, ord("q"), ord("Q")):
+                break
+
+            elif tecla == 32:
+                # Espaço: pausa ou continua.
+                pausado = not pausado
+
+            elif tecla == ord("1"):
+                velocidade = 0.25
+
+            elif tecla == ord("2"):
+                velocidade = 0.5
+
+            elif tecla == ord("3"):
+                velocidade = 1.0
+
+            elif tecla == ord("4"):
+                velocidade = 2.0
+
+            elif tecla in (ord("a"), ord("A")):
+                # Volta um quadro e pausa.
+                pausado = True
+
+                indice_quadro = max(0, indice_quadro - 1)
+
+                captura_replay.set(
+                    cv2.CAP_PROP_POS_FRAMES,
+                    indice_quadro,
+                )
+
+                sucesso, frame = captura_replay.read()
+
+                if sucesso:
+                    quadro_atual = frame
+
+            elif tecla in (ord("d"), ord("D")):
+                # Avança um quadro e pausa.
+                pausado = True
+
+                indice_quadro = min(
+                    max(0, total_quadros - 1),
+                    indice_quadro + 1,
+                )
+
+                captura_replay.set(
+                    cv2.CAP_PROP_POS_FRAMES,
+                    indice_quadro,
+                )
+
+                sucesso, frame = captura_replay.read()
+
+                if sucesso:
+                    quadro_atual = frame
+
+            # Detecta o fechamento pelo botão X.
+            try:
+                if (
+                    cv2.getWindowProperty(
+                        nome_janela,
+                        cv2.WND_PROP_VISIBLE,
+                    ) < 1
+                ):
+                    break
+
+            except cv2.error:
+                break
+
+    finally:
+        captura_replay.release()
+
+        try:
+            cv2.destroyWindow(nome_janela)
+        except cv2.error:
+            pass
 
 
 # =========================================================
@@ -410,6 +622,14 @@ def main():
 
     try:
         while executando:
+
+            # Abre o replay quando a gravação terminar.
+            replay_pronto = salvador.obter_replay_pronto()
+
+            if replay_pronto is not None:
+                visualizar_replay(replay_pronto)
+                continue
+
             frame = captura.obter_frame()
 
             if frame is None:
@@ -453,7 +673,7 @@ def main():
                 cv2.LINE_AA,
             )
 
-            # Indicador visual enquanto o MP4 é gerado.
+            # Indicador de salvamento.
             if salvador.esta_salvando():
                 texto_salvamento = "SALVANDO REPLAY..."
 
@@ -488,10 +708,22 @@ def main():
                 executando = False
 
             elif tecla == 32:
-                # Captura o conteúdo atual do buffer.
-                # O salvamento e a abertura acontecem em segundo plano.
+                # Copia o buffer e inicia o salvamento em segundo plano.
                 clipe = captura.obter_replay()
                 salvador.iniciar(clipe)
+
+            # Detecta o fechamento da janela ao vivo.
+            try:
+                if (
+                    cv2.getWindowProperty(
+                        nome_janela,
+                        cv2.WND_PROP_VISIBLE,
+                    ) < 1
+                ):
+                    executando = False
+
+            except cv2.error:
+                executando = False
 
     except KeyboardInterrupt:
         print("\nEncerrando o programa...")
@@ -499,7 +731,7 @@ def main():
     finally:
         captura.parar()
 
-        # Evita encerrar o programa antes de concluir um MP4.
+        # Espera a gravação terminar antes de encerrar.
         salvador.aguardar()
 
         cv2.destroyAllWindows()
