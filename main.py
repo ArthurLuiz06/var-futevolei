@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-DURACAO_BUFFER = 10
+DURACAO_BUFFER = 30
 QUALIDADE_JPEG = 80
 FPS_REPLAY = 30
 
