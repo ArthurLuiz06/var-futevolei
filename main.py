@@ -3,9 +3,9 @@ import cv2
 import threading
 import time
 import math
+import bisect
 import numpy as np
 
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -15,10 +15,23 @@ from pathlib import Path
 # =========================================================
 
 DURACAO_BUFFER = 30
-QUALIDADE_JPEG = 80
+QUALIDADE_JPEG = 92
 FPS_REPLAY = 30
 
 PASTA_REPLAYS = Path(__file__).resolve().parent / "replays"
+
+LARGURA_JANELA_AO_VIVO = 1200
+ALTURA_JANELA_AO_VIVO = 720
+
+LARGURA_PAINEL_CAMERA = 580
+ALTURA_IMAGEM_CAMERA = 326
+ALTURA_CABECALHO_CAMERA = 42
+
+LARGURA_REPLAY = 1100
+ALTURA_REPLAY = 680
+
+NOME_JANELA_AO_VIVO = "VAR Futevolei - Cameras ao Vivo"
+NOME_JANELA_REPLAY = "VAR Futevolei - Revisao do Replay"
 
 
 # =========================================================
@@ -26,15 +39,16 @@ PASTA_REPLAYS = Path(__file__).resolve().parent / "replays"
 # =========================================================
 
 class CapturaWebcam:
-    def __init__(self, indice_camera=0):
+    def __init__(self, indice_camera=0, nome_camera=None):
         self.indice_camera = indice_camera
+        self.nome_camera = nome_camera or f"Câmera {indice_camera + 1}"
         self.camera = None
 
         self.frame_atual = None
         self.lock_frame = threading.Lock()
 
-        # Cada item: (instante, imagem JPEG).
-        self.buffer = deque()
+        # Cada item: (instante_monotônico, imagem_jpeg).
+        self.buffer = []
         self.lock_buffer = threading.Lock()
 
         self.ativa = False
@@ -48,7 +62,10 @@ class CapturaWebcam:
         if not self.camera.isOpened():
             self.camera.release()
             self.camera = None
-            self.erro = "Não foi possível abrir a webcam."
+            self.erro = (
+                f"Não foi possível abrir a {self.nome_camera} "
+                f"(índice {self.indice_camera})."
+            )
             return False
 
         self.ativa = True
@@ -57,20 +74,25 @@ class CapturaWebcam:
             target=self._capturar,
             daemon=True,
         )
-
         self.thread.start()
+
         return True
 
     def _capturar(self):
         try:
             while self.ativa:
+                if self.camera is None:
+                    break
+
                 sucesso, frame = self.camera.read()
 
                 if not sucesso:
                     if self.ativa:
-                        self.erro = "Falha ao capturar imagem da webcam."
+                        self.erro = (
+                            f"Falha ao capturar imagem da "
+                            f"{self.nome_camera}."
+                        )
                         time.sleep(0.02)
-
                     continue
 
                 instante = time.monotonic()
@@ -99,11 +121,14 @@ class CapturaWebcam:
                         self.buffer
                         and self.buffer[0][0] < limite
                     ):
-                        _, dados_antigos = self.buffer.popleft()
+                        _, dados_antigos = self.buffer.pop(0)
                         self.total_bytes_buffer -= len(dados_antigos)
 
         except Exception as erro:
-            self.erro = f"Erro durante a captura: {erro}"
+            self.erro = (
+                f"Erro durante a captura da {self.nome_camera}: "
+                f"{erro}"
+            )
 
         finally:
             self.ativa = False
@@ -133,9 +158,7 @@ class CapturaWebcam:
             if quantidade < 2:
                 return 0.0, quantidade, memoria_mb
 
-            duracao = (
-                self.buffer[-1][0] - self.buffer[0][0]
-            )
+            duracao = self.buffer[-1][0] - self.buffer[0][0]
 
             return duracao, quantidade, memoria_mb
 
@@ -151,7 +174,7 @@ class CapturaWebcam:
 
 
 # =========================================================
-# DECODIFICAÇÃO DOS QUADROS
+# FUNÇÕES DE VÍDEO
 # =========================================================
 
 def decodificar_frame(frame_jpeg):
@@ -162,40 +185,133 @@ def decodificar_frame(frame_jpeg):
     )
 
 
-# =========================================================
-# SALVAMENTO DO REPLAY EM MP4
-# =========================================================
+def sincronizar_clipes(clipes_por_camera):
+    """
+    Cria uma linha do tempo compartilhada para as câmeras.
 
-def salvar_replay_mp4(clipe):
-    """Salva o buffer em MP4 e retorna o caminho do arquivo criado."""
+    Os buffers usam time.monotonic(), permitindo comparar
+    os instantes capturados durante a mesma execução.
+
+    Os vídeos resultantes terão a mesma quantidade de quadros
+    e FPS para facilitar a alternância entre ângulos.
+    """
+    clipes_validos = {}
+
+    for indice, clipe in clipes_por_camera.items():
+        clipe_valido = [
+            (instante, imagem)
+            for instante, imagem in clipe
+            if imagem is not None
+        ]
+
+        if clipe_valido:
+            clipes_validos[indice] = clipe_valido
+
+    if not clipes_validos:
+        print("Nenhuma câmera possui quadros disponíveis.")
+        return {}
+
+    inicio_comum = max(
+        clipe[0][0]
+        for clipe in clipes_validos.values()
+    )
+
+    fim_comum = min(
+        clipe[-1][0]
+        for clipe in clipes_validos.values()
+    )
+
+    if fim_comum <= inicio_comum:
+        print(
+            "Não existe intervalo compartilhado suficiente "
+            "para sincronizar as câmeras."
+        )
+        return {}
+
+    quantidade_quadros = max(
+        1,
+        int((fim_comum - inicio_comum) * FPS_REPLAY) + 1,
+    )
+
+    clipes_sincronizados = {}
+
+    for indice, clipe in clipes_validos.items():
+        instantes = [item[0] for item in clipe]
+        quadros = []
+        posicao = 0
+
+        for numero_quadro in range(quantidade_quadros):
+            instante_alvo = (
+                inicio_comum + numero_quadro / FPS_REPLAY
+            )
+
+            posicao = bisect.bisect_left(
+                instantes,
+                instante_alvo,
+                lo=posicao,
+            )
+
+            if posicao <= 0:
+                escolhido = 0
+            elif posicao >= len(clipe):
+                escolhido = len(clipe) - 1
+            else:
+                anterior = posicao - 1
+
+                distancia_anterior = abs(
+                    instantes[anterior] - instante_alvo
+                )
+
+                distancia_seguinte = abs(
+                    instantes[posicao] - instante_alvo
+                )
+
+                escolhido = (
+                    anterior
+                    if distancia_anterior <= distancia_seguinte
+                    else posicao
+                )
+
+            quadros.append(clipe[escolhido][1])
+
+        clipes_sincronizados[indice] = quadros
+
+    return clipes_sincronizados
+
+
+def salvar_replay_mp4(clipe, identificador_lance, indice_camera):
+    """Salva um ângulo do lance em MP4."""
     if not clipe:
-        print("Não há imagens disponíveis para salvar.")
+        print(
+            f"Câmera {indice_camera + 1}: "
+            "não há quadros para salvar."
+        )
         return None
 
     PASTA_REPLAYS.mkdir(parents=True, exist_ok=True)
 
     primeiro_frame = None
 
-    for _, frame_jpeg in clipe:
+    for frame_jpeg in clipe:
         primeiro_frame = decodificar_frame(frame_jpeg)
 
         if primeiro_frame is not None:
             break
 
     if primeiro_frame is None:
-        print("Não foi possível decodificar os quadros do replay.")
+        print(
+            f"Câmera {indice_camera + 1}: "
+            "não foi possível decodificar os quadros."
+        )
         return None
 
     altura, largura = primeiro_frame.shape[:2]
 
     nome_arquivo = (
-        "replay_"
-        + datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
-        + ".mp4"
+        f"{identificador_lance}_camera{indice_camera + 1}.mp4"
     )
 
     caminho_arquivo = PASTA_REPLAYS / nome_arquivo
-
     quatrocc = cv2.VideoWriter_fourcc(*"mp4v")
 
     gravador = cv2.VideoWriter(
@@ -207,15 +323,18 @@ def salvar_replay_mp4(clipe):
 
     if not gravador.isOpened():
         gravador.release()
-        print("Não foi possível criar o arquivo MP4.")
-        print("Verifique o suporte a vídeo do OpenCV.")
+
+        print(
+            f"Câmera {indice_camera + 1}: "
+            "não foi possível criar o arquivo MP4."
+        )
         return None
 
     quadros_salvos = 0
     erro_gravacao = None
 
     try:
-        for _, frame_jpeg in clipe:
+        for frame_jpeg in clipe:
             frame = decodificar_frame(frame_jpeg)
 
             if frame is None:
@@ -227,7 +346,7 @@ def salvar_replay_mp4(clipe):
             ):
                 frame = cv2.resize(frame, (largura, altura))
 
-            # Grava somente o vídeo da câmera, sem a interface.
+            # Salva somente o vídeo, sem a interface.
             gravador.write(frame)
             quadros_salvos += 1
 
@@ -238,37 +357,42 @@ def salvar_replay_mp4(clipe):
         gravador.release()
 
     if erro_gravacao is not None:
-        print(f"Erro ao gravar o replay: {erro_gravacao}")
+        print(
+            f"Erro ao gravar a Câmera {indice_camera + 1}: "
+            f"{erro_gravacao}"
+        )
         return None
 
     if quadros_salvos == 0:
-        print("Nenhum quadro foi salvo.")
+        print(
+            f"Câmera {indice_camera + 1}: "
+            "nenhum quadro foi salvo."
+        )
         return None
 
     if (
         not caminho_arquivo.exists()
         or caminho_arquivo.stat().st_size == 0
     ):
-        print("O arquivo MP4 não foi criado corretamente.")
+        print(
+            f"Câmera {indice_camera + 1}: "
+            "o arquivo MP4 não foi criado corretamente."
+        )
         return None
 
-    print("\n" + "=" * 48)
-    print("REPLAY SALVO COM SUCESSO!")
-    print("=" * 48)
-    print(f"Arquivo: {caminho_arquivo}")
-    print(f"Quadros salvos: {quadros_salvos}")
+    tamanho_mb = caminho_arquivo.stat().st_size / (1024 * 1024)
+
     print(
-        f"Tamanho: "
-        f"{caminho_arquivo.stat().st_size / (1024 * 1024):.2f} MB"
+        f"Câmera {indice_camera + 1} salva: "
+        f"{caminho_arquivo.name} | "
+        f"{quadros_salvos} quadros | {tamanho_mb:.2f} MB"
     )
-    print("O replay será aberto no visualizador do VAR.")
-    print("=" * 48)
 
     return caminho_arquivo
 
 
 # =========================================================
-# GERENCIADOR DE SALVAMENTO EM SEGUNDO PLANO
+# SALVAMENTO DOS ÂNGULOS EM SEGUNDO PLANO
 # =========================================================
 
 class SalvadorReplay:
@@ -278,10 +402,16 @@ class SalvadorReplay:
         self.em_andamento = False
         self.replay_pronto = None
 
-    def iniciar(self, clipe):
-        """Inicia a gravação em uma thread separada."""
-        if not clipe:
-            print("O buffer ainda não possui quadros para salvar.")
+    def iniciar(self, clipes_por_camera):
+        """Recebe os buffers e inicia o salvamento."""
+        clipes_validos = {
+            indice: list(clipe)
+            for indice, clipe in clipes_por_camera.items()
+            if clipe
+        }
+
+        if not clipes_validos:
+            print("Nenhuma câmera possui quadros para salvar.")
             return False
 
         with self.lock:
@@ -293,14 +423,14 @@ class SalvadorReplay:
                 return False
 
             self.em_andamento = True
+            self.replay_pronto = None
 
             try:
                 self.thread = threading.Thread(
                     target=self._executar_salvamento,
-                    args=(clipe,),
+                    args=(clipes_validos,),
                     daemon=False,
                 )
-
                 self.thread.start()
 
             except Exception:
@@ -309,23 +439,57 @@ class SalvadorReplay:
 
         print(
             "Solicitação recebida! "
-            "O vídeo ao vivo continuará funcionando."
+            "Os ângulos serão salvos em segundo plano."
         )
 
         return True
 
-    def _executar_salvamento(self, clipe):
-        caminho = None
+    def _executar_salvamento(self, clipes_por_camera):
+        resultado = None
 
         try:
-            caminho = salvar_replay_mp4(clipe)
+            sincronizados = sincronizar_clipes(clipes_por_camera)
+
+            if sincronizados:
+                identificador = (
+                    "replay_"
+                    + datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
+                )
+
+                caminhos = {}
+
+                for indice, quadros in sincronizados.items():
+                    caminho = salvar_replay_mp4(
+                        quadros,
+                        identificador,
+                        indice,
+                    )
+
+                    if caminho is not None:
+                        caminhos[indice] = caminho
+
+                if caminhos:
+                    resultado = {
+                        "caminhos": caminhos,
+                        "identificador": identificador,
+                    }
+
+                    print("\n" + "=" * 48)
+                    print("LANCE SALVO COM SUCESSO!")
+                    print("=" * 48)
+
+                    for indice, caminho in caminhos.items():
+                        print(f"Câmera {indice + 1}: {caminho}")
+
+                    print("Abrindo o visualizador de replay...")
+                    print("=" * 48)
 
         except Exception as erro:
-            print(f"Erro inesperado ao salvar replay: {erro}")
+            print(f"Erro inesperado ao salvar o replay: {erro}")
 
         finally:
             with self.lock:
-                self.replay_pronto = caminho
+                self.replay_pronto = resultado
                 self.em_andamento = False
 
     def esta_salvando(self):
@@ -333,14 +497,14 @@ class SalvadorReplay:
             return self.em_andamento
 
     def obter_replay_pronto(self):
-        """Entrega o replay recém-salvo uma única vez."""
+        """Entrega os vídeos recém-salvos uma única vez."""
         with self.lock:
-            caminho = self.replay_pronto
+            resultado = self.replay_pronto
             self.replay_pronto = None
-            return caminho
+            return resultado
 
     def aguardar(self):
-        """Aguarda a conclusão do salvamento antes de encerrar."""
+        """Aguarda o término do salvamento."""
         with self.lock:
             thread = self.thread
 
@@ -350,7 +514,7 @@ class SalvadorReplay:
 
 
 # =========================================================
-# FUNÇÕES AUXILIARES DA INTERFACE DO REPLAY
+# INTERFACE E FORMATAÇÃO
 # =========================================================
 
 def desenhar_texto_legivel(
@@ -360,7 +524,6 @@ def desenhar_texto_legivel(
     escala=0.42,
     cor=(255, 255, 255),
 ):
-    """Desenha texto com contorno para facilitar a leitura."""
     cv2.putText(
         imagem,
         texto,
@@ -386,275 +549,435 @@ def desenhar_texto_legivel(
 
 def formatar_tempo(segundos):
     segundos = max(0, int(segundos))
-
     minutos = segundos // 60
     segundos_restantes = segundos % 60
 
     return f"{minutos:02d}:{segundos_restantes:02d}"
 
 
+def ajustar_imagem(frame, largura, altura):
+    """Redimensiona mantendo a proporção original."""
+    altura_frame, largura_frame = frame.shape[:2]
+
+    escala = min(
+        largura / largura_frame,
+        altura / altura_frame,
+    )
+
+    nova_largura = max(1, int(largura_frame * escala))
+    nova_altura = max(1, int(altura_frame * escala))
+
+    redimensionado = cv2.resize(
+        frame,
+        (nova_largura, nova_altura),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    tela = np.zeros((altura, largura, 3), dtype=np.uint8)
+    tela[:] = (12, 15, 20)
+
+    x = (largura - nova_largura) // 2
+    y = (altura - nova_altura) // 2
+
+    tela[
+        y:y + nova_altura,
+        x:x + nova_largura,
+    ] = redimensionado
+
+    return tela
+
+
 # =========================================================
-# VISUALIZADOR DE REPLAY
+# VISUALIZADOR MULTICÂMERA DE REPLAY
 # =========================================================
 
-def visualizar_replay(caminho_arquivo):
+def visualizar_replay(
+    resultado_replay,
+    capturas_ao_vivo=None,
+    nome_janela_ao_vivo=NOME_JANELA_AO_VIVO,
+    salvador=None,
+):
     """
-    Visualizador com:
-    - Barra de progresso clicável.
-    - Tempo atual e restante.
-    - Câmera lenta e câmera acelerada.
-    - Navegação quadro a quadro.
-    - Reinício do replay.
-    - Temporização baseada no relógio monotônico.
-    - Compensação de atrasos durante a reprodução.
-    - Interface sem instruções sobrepostas ao vídeo.
+    Reproduz o lance enquanto mantém a janela ao vivo atualizada.
+
+    A captura das webcams continua nas respectivas threads.
+    Durante o replay, esta função também atualiza a interface
+    ao vivo a cada ciclo da reprodução.
     """
+    caminhos = resultado_replay.get("caminhos", {})
 
-    captura_replay = cv2.VideoCapture(str(caminho_arquivo))
-
-    if not captura_replay.isOpened():
-        print("Não foi possível abrir o replay no visualizador.")
-        captura_replay.release()
+    if not caminhos:
+        print("Não há vídeos disponíveis para reproduzir.")
         return
 
-    total_quadros = int(
-        captura_replay.get(cv2.CAP_PROP_FRAME_COUNT)
-    )
+    capturas = {}
 
-    fps_arquivo = captura_replay.get(cv2.CAP_PROP_FPS)
+    for indice, caminho in caminhos.items():
+        captura = cv2.VideoCapture(str(caminho))
 
-    if not fps_arquivo or fps_arquivo <= 0:
-        fps_arquivo = FPS_REPLAY
+        if captura.isOpened():
+            capturas[indice] = captura
+        else:
+            captura.release()
+            print(
+                f"Não foi possível abrir o vídeo da "
+                f"Câmera {indice + 1}."
+            )
 
-    duracao_total = (
-        total_quadros / fps_arquivo
-        if total_quadros > 0
-        else 0.0
-    )
+    if not capturas:
+        print("Não foi possível abrir nenhum ângulo do replay.")
+        return
 
+    indices_disponiveis = sorted(capturas.keys())
+
+    total_quadros_por_camera = {
+        indice: int(captura.get(cv2.CAP_PROP_FRAME_COUNT))
+        for indice, captura in capturas.items()
+    }
+
+    fps_arquivo = FPS_REPLAY
+
+    total_quadros = min(total_quadros_por_camera.values())
+
+    if total_quadros <= 0:
+        for captura in capturas.values():
+            captura.release()
+
+        print("O replay não contém quadros válidos.")
+        return
+
+    duracao_total = total_quadros / fps_arquivo
+
+    camera_atual = indices_disponiveis[0]
     indice_quadro = 0
     velocidade = 1.0
     pausado = False
-    quadro_atual = None
 
-    # Relógio usado para manter o ritmo da reprodução.
-    proximo_instante_frame = time.perf_counter()
+    quadros_atuais = {}
 
-    nome_janela = "VAR Futevolei - Revisao do Replay"
+    # Carrega o primeiro quadro de cada câmera.
+    for indice, captura in capturas.items():
+        captura.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        sucesso, frame = captura.read()
+
+        if sucesso:
+            quadros_atuais[indice] = frame
+
+    if camera_atual not in quadros_atuais:
+        for captura in capturas.values():
+            captura.release()
+
+        print("Não foi possível ler o primeiro quadro do replay.")
+        return
 
     estado_mouse = {
-        "solicitar_quadro": None
+        "solicitar_quadro": None,
+        "solicitar_camera": None,
     }
+
+    botoes_camera = {}
+
+    def posicionar_em_quadro(indice_alvo):
+        """Posiciona os vídeos no mesmo quadro."""
+        nonlocal indice_quadro
+
+        indice_quadro = max(
+            0,
+            min(indice_alvo, total_quadros - 1),
+        )
+
+        for indice, captura in capturas.items():
+            captura.set(
+                cv2.CAP_PROP_POS_FRAMES,
+                indice_quadro,
+            )
+
+            sucesso, frame = captura.read()
+
+            if sucesso:
+                quadros_atuais[indice] = frame
+
+    def avancar_quadro_sequencial(quantidade):
+        """
+        Avança sequencialmente no vídeo da câmera atual,
+        evitando reposicionar o arquivo em cada quadro.
+        """
+        nonlocal indice_quadro
+
+        novo_indice = min(
+            total_quadros - 1,
+            indice_quadro + quantidade,
+        )
+
+        quantidade_real = novo_indice - indice_quadro
+
+        if quantidade_real <= 0:
+            return
+
+        captura = capturas[camera_atual]
+
+        for _ in range(quantidade_real - 1):
+            if not captura.grab():
+                break
+
+        sucesso, frame = captura.read()
+
+        if sucesso:
+            quadros_atuais[camera_atual] = frame
+            indice_quadro = novo_indice
+        else:
+            posicionar_em_quadro(novo_indice)
 
     def ao_clicar_mouse(evento, x, y, flags, parametro):
         if evento != cv2.EVENT_LBUTTONDOWN:
             return
 
-        largura_janela = parametro["largura"]
-        altura_janela = parametro["altura"]
+        # Seleção de câmera.
+        for indice, area in botoes_camera.items():
+            x1, y1, x2, y2 = area
 
-        y_barra = altura_janela - 34
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                estado_mouse["solicitar_camera"] = indice
+                return
+
+        # Barra de progresso.
+        y_barra = 610
         x_inicio = 20
-        x_fim = max(x_inicio + 1, largura_janela - 20)
+        x_fim = LARGURA_REPLAY - 20
 
         if (
             y_barra - 12 <= y <= y_barra + 12
             and x_inicio <= x <= x_fim
         ):
-            proporcao = (
-                (x - x_inicio) / (x_fim - x_inicio)
-            )
+            proporcao = (x - x_inicio) / (x_fim - x_inicio)
 
-            alvo = int(
+            estado_mouse["solicitar_quadro"] = int(
                 proporcao * max(total_quadros - 1, 0)
             )
 
-            estado_mouse["solicitar_quadro"] = alvo
-
-    cv2.namedWindow(
-        nome_janela,
-        cv2.WINDOW_NORMAL,
-    )
-
+    cv2.namedWindow(NOME_JANELA_REPLAY, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(
-        nome_janela,
-        1100,
-        650,
+        NOME_JANELA_REPLAY,
+        LARGURA_REPLAY,
+        ALTURA_REPLAY,
     )
-
-    dimensoes_janela = {
-        "largura": 1100,
-        "altura": 650,
-    }
-
     cv2.setMouseCallback(
-        nome_janela,
+        NOME_JANELA_REPLAY,
         ao_clicar_mouse,
-        dimensoes_janela,
     )
 
-    print("\n" + "=" * 48)
-    print("VISUALIZADOR DE REPLAY")
+    print("\n" + "=" * 54)
+    print("VISUALIZADOR MULTICÂMERA DE REPLAY")
+    print("O ao vivo continuará funcionando durante a análise.")
+    print("Clique em CÂMERA 1 ou CÂMERA 2 para mudar o ângulo.")
     print("ESPAÇO: pausar/continuar")
     print("1: 0,25x | 2: 0,5x | 3: 1x | 4: 2x")
     print("A / seta esquerda: quadro anterior")
     print("D / seta direita: próximo quadro")
     print("R: reiniciar | clique na barra: buscar momento")
     print("Q ou ESC: fechar replay e voltar ao ao vivo")
-    print("=" * 48 + "\n")
+    print("=" * 54 + "\n")
+
+    intervalo_frame = 1.0 / (fps_arquivo * velocidade)
+    proximo_instante_frame = time.perf_counter() + intervalo_frame
 
     try:
         while True:
-            inicio_ciclo = time.perf_counter()
+            # =================================================
+            # ATUALIZAÇÃO DO AO VIVO DURANTE O REPLAY
+            # =================================================
+            #
+            # A captura continua nas threads. Aqui atualizamos
+            # a janela visual do ao vivo enquanto o replay roda.
+            # Não abrimos novamente nenhuma webcam.
+            #
+            if capturas_ao_vivo:
+                try:
+                    tela_ao_vivo = montar_grade_ao_vivo(
+                        capturas_ao_vivo,
+                        salvador.esta_salvando() if salvador else False,
+                    )
 
-            try:
-                retangulo = cv2.getWindowImageRect(nome_janela)
+                    cv2.imshow(
+                        nome_janela_ao_vivo,
+                        tela_ao_vivo,
+                    )
 
-                if (
-                    retangulo
-                    and retangulo[2] > 0
-                    and retangulo[3] > 0
-                ):
-                    dimensoes_janela["largura"] = retangulo[2]
-                    dimensoes_janela["altura"] = retangulo[3]
+                except cv2.error:
+                    pass
 
-            except (cv2.error, AttributeError):
-                pass
-
-            # -------------------------------------------------
-            # BUSCA PELO CLIQUE NA BARRA
-            # -------------------------------------------------
+            # ---------------------------------------------
+            # BUSCA NA BARRA DE PROGRESSO
+            # ---------------------------------------------
 
             quadro_solicitado = estado_mouse["solicitar_quadro"]
 
             if quadro_solicitado is not None:
-                indice_quadro = max(
-                    0,
-                    min(
-                        quadro_solicitado,
-                        max(total_quadros - 1, 0),
-                    ),
+                posicionar_em_quadro(quadro_solicitado)
+
+                estado_mouse["solicitar_quadro"] = None
+                pausado = True
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
                 )
 
-                captura_replay.set(
+            # ---------------------------------------------
+            # TROCA DE CÂMERA
+            # ---------------------------------------------
+
+            camera_solicitada = estado_mouse["solicitar_camera"]
+
+            if (
+                camera_solicitada is not None
+                and camera_solicitada in capturas
+            ):
+                camera_atual = camera_solicitada
+
+                capturas[camera_atual].set(
                     cv2.CAP_PROP_POS_FRAMES,
                     indice_quadro,
                 )
 
-                sucesso, frame = captura_replay.read()
-
-                estado_mouse["solicitar_quadro"] = None
-                pausado = True
-
-                # Reinicia a referência temporal após a busca.
-                proximo_instante_frame = time.perf_counter()
+                sucesso, frame = capturas[camera_atual].read()
 
                 if sucesso:
-                    quadro_atual = frame
-                else:
-                    continue
+                    quadros_atuais[camera_atual] = frame
 
-            # -------------------------------------------------
-            # LEITURA DO PRÓXIMO QUADRO
-            # -------------------------------------------------
+                estado_mouse["solicitar_camera"] = None
 
-            if not pausado or quadro_atual is None:
-                sucesso, frame = captura_replay.read()
+            # ---------------------------------------------
+            # QUADRO ATUAL DO REPLAY
+            # ---------------------------------------------
 
-                if not sucesso:
-                    if total_quadros <= 0:
-                        break
+            frame = quadros_atuais.get(camera_atual)
 
-                    pausado = True
-                    indice_quadro = max(0, total_quadros - 1)
+            if frame is None:
+                posicionar_em_quadro(indice_quadro)
+                frame = quadros_atuais.get(camera_atual)
 
-                    captura_replay.set(
-                        cv2.CAP_PROP_POS_FRAMES,
-                        indice_quadro,
-                    )
+                if frame is None:
+                    break
 
-                    sucesso, frame = captura_replay.read()
-
-                    if not sucesso:
-                        break
-
-                else:
-                    indice_quadro = max(
-                        0,
-                        int(
-                            captura_replay.get(
-                                cv2.CAP_PROP_POS_FRAMES
-                            )
-                        ) - 1,
-                    )
-
-                quadro_atual = frame
-
-            tela = quadro_atual.copy()
-
-            altura, largura = tela.shape[:2]
-
-            tempo_atual = (
-                indice_quadro / fps_arquivo
-                if fps_arquivo > 0
-                else 0.0
+            tela = np.zeros(
+                (ALTURA_REPLAY, LARGURA_REPLAY, 3),
+                dtype=np.uint8,
             )
-
-            tempo_restante = max(
-                0.0,
-                duracao_total - tempo_atual,
-            )
-
-            # -------------------------------------------------
-            # STATUS SUPERIOR
-            # -------------------------------------------------
+            tela[:] = (18, 22, 29)
 
             cv2.rectangle(
                 tela,
                 (0, 0),
-                (largura, 48),
-                (25, 25, 25),
+                (LARGURA_REPLAY, 44),
+                (30, 36, 46),
                 -1,
             )
 
-            estado_texto = (
-                "PAUSADO"
-                if pausado
-                else "REPRODUZINDO"
+            botoes_camera.clear()
+            posicao_x = 14
+
+            for indice in indices_disponiveis:
+                texto_botao = f"CAMERA {indice + 1}"
+
+                tamanho = cv2.getTextSize(
+                    texto_botao,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    1,
+                )[0]
+
+                largura_botao = tamanho[0] + 26
+
+                x1 = posicao_x
+                y1 = 7
+                x2 = x1 + largura_botao
+                y2 = 37
+
+                cor_fundo = (
+                    (0, 130, 190)
+                    if indice == camera_atual
+                    else (55, 63, 76)
+                )
+
+                cv2.rectangle(
+                    tela,
+                    (x1, y1),
+                    (x2, y2),
+                    cor_fundo,
+                    -1,
+                )
+
+                cv2.rectangle(
+                    tela,
+                    (x1, y1),
+                    (x2, y2),
+                    (105, 120, 140),
+                    1,
+                )
+
+                cv2.putText(
+                    tela,
+                    texto_botao,
+                    (x1 + 13, y1 + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                botoes_camera[indice] = (x1, y1, x2, y2)
+                posicao_x = x2 + 9
+
+            estado_texto = "PAUSADO" if pausado else "REPRODUZINDO"
+
+            cv2.putText(
+                tela,
+                f"{estado_texto} | {velocidade:g}x",
+                (posicao_x + 8, 27),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (100, 230, 150),
+                1,
+                cv2.LINE_AA,
             )
 
-            texto_status = (
-                f"{estado_texto} | {velocidade:g}x | "
-                f"Tempo: {formatar_tempo(tempo_atual)} / "
-                f"{formatar_tempo(duracao_total)} | "
-                f"Quadro: {indice_quadro + 1}/"
-                f"{max(total_quadros, 1)}"
+            video = ajustar_imagem(
+                frame,
+                LARGURA_REPLAY,
+                530,
+            )
+
+            tela[48:578, :] = video
+
+            cv2.rectangle(
+                tela,
+                (12, 56),
+                (155, 84),
+                (15, 18, 24),
+                -1,
             )
 
             cv2.putText(
                 tela,
-                texto_status,
-                (12, 31),
+                f"ANGULO {camera_atual + 1}",
+                (21, 75),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.58,
-                (0, 255, 0),
-                2,
+                0.48,
+                (255, 255, 255),
+                1,
                 cv2.LINE_AA,
             )
 
-            # -------------------------------------------------
+            # ---------------------------------------------
             # BARRA DE PROGRESSO
-            # -------------------------------------------------
+            # ---------------------------------------------
 
-            y_barra = max(55, altura - 34)
-
+            y_barra = 610
             x_inicio = 20
-            x_fim = max(x_inicio + 1, largura - 20)
+            x_fim = LARGURA_REPLAY - 20
 
             progresso = (
                 indice_quadro / max(total_quadros - 1, 1)
-                if total_quadros > 1
-                else 0.0
             )
 
             x_progresso = int(
@@ -665,8 +988,8 @@ def visualizar_replay(caminho_arquivo):
                 tela,
                 (x_inicio, y_barra),
                 (x_fim, y_barra),
-                (190, 190, 190),
-                2,
+                (105, 115, 130),
+                4,
                 cv2.LINE_AA,
             )
 
@@ -674,185 +997,139 @@ def visualizar_replay(caminho_arquivo):
                 tela,
                 (x_inicio, y_barra),
                 (x_progresso, y_barra),
-                (0, 200, 255),
-                3,
+                (0, 190, 255),
+                4,
                 cv2.LINE_AA,
             )
 
             cv2.circle(
                 tela,
                 (x_progresso, y_barra),
-                5,
-                (0, 0, 0),
+                6,
+                (245, 245, 245),
                 -1,
                 cv2.LINE_AA,
             )
 
-            cv2.circle(
-                tela,
-                (x_progresso, y_barra),
-                3,
-                (255, 255, 255),
-                -1,
-                cv2.LINE_AA,
+            tempo_atual = indice_quadro / fps_arquivo
+            tempo_restante = max(
+                0.0,
+                duracao_total - tempo_atual,
             )
-
-            # -------------------------------------------------
-            # TEMPO ATUAL E TEMPO RESTANTE
-            # -------------------------------------------------
-
-            texto_atual = formatar_tempo(tempo_atual)
-            texto_restante = f"-{formatar_tempo(tempo_restante)}"
-
-            escala_tempo = 0.42
-            y_tempo = altura - 8
 
             desenhar_texto_legivel(
                 tela,
-                texto_atual,
-                (x_inicio, y_tempo),
-                escala=escala_tempo,
+                formatar_tempo(tempo_atual),
+                (20, 638),
+                escala=0.43,
             )
+
+            texto_restante = f"-{formatar_tempo(tempo_restante)}"
 
             tamanho_restante = cv2.getTextSize(
                 texto_restante,
                 cv2.FONT_HERSHEY_SIMPLEX,
-                escala_tempo,
+                0.43,
                 1,
             )[0]
-
-            x_tempo_restante = max(
-                x_inicio,
-                largura - tamanho_restante[0] - 20,
-            )
 
             desenhar_texto_legivel(
                 tela,
                 texto_restante,
-                (x_tempo_restante, y_tempo),
-                escala=escala_tempo,
+                (
+                    LARGURA_REPLAY - tamanho_restante[0] - 20,
+                    638,
+                ),
+                escala=0.43,
             )
 
-            cv2.imshow(nome_janela, tela)
+            cv2.putText(
+                tela,
+                "ESPACO: pausar | A/D: quadro | 1-4: velocidade | R: reiniciar | Q: sair",
+                (20, 665),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.39,
+                (205, 213, 225),
+                1,
+                cv2.LINE_AA,
+            )
 
-            # -------------------------------------------------
+            cv2.imshow(NOME_JANELA_REPLAY, tela)
+
+            # ---------------------------------------------
             # TEMPORIZAÇÃO DA REPRODUÇÃO
-            # -------------------------------------------------
-            #
-            # O intervalo é calculado usando o FPS real do
-            # arquivo e a velocidade selecionada.
-            #
-            # Exemplo: 30 FPS em 2x = 60 quadros por segundo
-            # de reprodução, ou aproximadamente 16,67 ms
-            # entre quadros exibidos.
-            #
-            # O relógio monotônico evita que o tempo gasto
-            # renderizando a interface seja somado ao atraso
-            # de cada quadro.
-            # -------------------------------------------------
+            # ---------------------------------------------
 
             if pausado:
-                tecla = cv2.waitKeyEx(30)
-
-                # Não acumula atrasos enquanto estiver pausado.
-                proximo_instante_frame = time.perf_counter()
-
+                tecla = cv2.waitKeyEx(15)
             else:
-                intervalo_frame = 1.0 / (
-                    fps_arquivo * velocidade
-                )
-
-                proximo_instante_frame += intervalo_frame
-
                 agora = time.perf_counter()
-                tempo_espera = proximo_instante_frame - agora
+                espera = proximo_instante_frame - agora
 
-                if tempo_espera > 0:
-                    atraso_ms = max(
-                        1,
-                        int(math.ceil(tempo_espera * 1000)),
+                if espera > 0:
+                    tecla = cv2.waitKeyEx(
+                        max(1, int(math.ceil(espera * 1000)))
                     )
-
-                    tecla = cv2.waitKeyEx(atraso_ms)
-
                 else:
-                    # Continua verificando os comandos sem
-                    # acrescentar um atraso artificial grande.
                     tecla = cv2.waitKeyEx(1)
 
-                    # Se o processamento atrasou a reprodução,
-                    # pula quadros para recuperar o ritmo real.
-                    agora = time.perf_counter()
-                    atraso = agora - proximo_instante_frame
-
-                    if atraso >= intervalo_frame:
-                        quadros_pular = int(
-                            atraso / intervalo_frame
-                        )
-
-                        quadros_disponiveis = max(
-                            0,
-                            total_quadros - indice_quadro - 1,
-                        )
-
-                        quadros_pular = min(
-                            quadros_pular,
-                            quadros_disponiveis,
-                        )
-
-                        for _ in range(quadros_pular):
-                            if not captura_replay.grab():
-                                break
-
-                            indice_quadro += 1
-
-                            proximo_instante_frame += (
-                                intervalo_frame
-                            )
-
-            # -------------------------------------------------
-            # CONTROLES DO REPLAY
-            # -------------------------------------------------
+            # ---------------------------------------------
+            # CONTROLES
+            # ---------------------------------------------
 
             if tecla in (27, ord("q"), ord("Q")):
                 break
 
-            elif tecla == 32:  # Espaço
+            elif tecla == 32:
                 pausado = not pausado
-                proximo_instante_frame = time.perf_counter()
+
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
+                )
 
             elif tecla == ord("1"):
                 velocidade = 0.25
-                proximo_instante_frame = time.perf_counter()
+                intervalo_frame = 1.0 / (
+                    fps_arquivo * velocidade
+                )
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
+                )
 
             elif tecla == ord("2"):
                 velocidade = 0.5
-                proximo_instante_frame = time.perf_counter()
+                intervalo_frame = 1.0 / (
+                    fps_arquivo * velocidade
+                )
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
+                )
 
             elif tecla == ord("3"):
                 velocidade = 1.0
-                proximo_instante_frame = time.perf_counter()
+                intervalo_frame = 1.0 / (
+                    fps_arquivo * velocidade
+                )
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
+                )
 
             elif tecla == ord("4"):
                 velocidade = 2.0
-                proximo_instante_frame = time.perf_counter()
-
-            elif tecla in (ord("r"), ord("R")):
-                # Reinicia desde o começo e volta a reproduzir.
-                indice_quadro = 0
-
-                captura_replay.set(
-                    cv2.CAP_PROP_POS_FRAMES,
-                    0,
+                intervalo_frame = 1.0 / (
+                    fps_arquivo * velocidade
+                )
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
                 )
 
-                sucesso, frame = captura_replay.read()
-
-                if sucesso:
-                    quadro_atual = frame
-
+            elif tecla in (ord("r"), ord("R")):
+                posicionar_em_quadro(0)
                 pausado = False
-                proximo_instante_frame = time.perf_counter()
+
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
+                )
 
             elif tecla in (
                 ord("a"),
@@ -860,25 +1137,12 @@ def visualizar_replay(caminho_arquivo):
                 2424832,
                 81,
             ):
-                # Volta exatamente um quadro e pausa.
                 pausado = True
+                posicionar_em_quadro(indice_quadro - 1)
 
-                indice_quadro = max(
-                    0,
-                    indice_quadro - 1,
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
                 )
-
-                captura_replay.set(
-                    cv2.CAP_PROP_POS_FRAMES,
-                    indice_quadro,
-                )
-
-                sucesso, frame = captura_replay.read()
-
-                if sucesso:
-                    quadro_atual = frame
-
-                proximo_instante_frame = time.perf_counter()
 
             elif tecla in (
                 ord("d"),
@@ -886,46 +1150,332 @@ def visualizar_replay(caminho_arquivo):
                 2555904,
                 83,
             ):
-                # Avança exatamente um quadro e pausa.
                 pausado = True
+                posicionar_em_quadro(indice_quadro + 1)
 
-                indice_quadro = min(
-                    max(0, total_quadros - 1),
-                    indice_quadro + 1,
+                proximo_instante_frame = (
+                    time.perf_counter() + intervalo_frame
                 )
 
-                captura_replay.set(
-                    cv2.CAP_PROP_POS_FRAMES,
-                    indice_quadro,
-                )
+            # ---------------------------------------------
+            # AVANÇO NORMAL DO VÍDEO
+            # ---------------------------------------------
 
-                sucesso, frame = captura_replay.read()
+            if not pausado:
+                agora = time.perf_counter()
 
-                if sucesso:
-                    quadro_atual = frame
+                if agora >= proximo_instante_frame:
+                    atraso = agora - proximo_instante_frame
 
-                proximo_instante_frame = time.perf_counter()
+                    quadros_para_avancar = (
+                        1 + int(atraso / intervalo_frame)
+                    )
+
+                    quadros_para_avancar = min(
+                        quadros_para_avancar,
+                        total_quadros - 1 - indice_quadro,
+                    )
+
+                    if quadros_para_avancar > 0:
+                        avancar_quadro_sequencial(
+                            quadros_para_avancar
+                        )
+
+                    if indice_quadro >= total_quadros - 1:
+                        pausado = True
+                    else:
+                        proximo_instante_frame += (
+                            quadros_para_avancar * intervalo_frame
+                        )
+
+                        agora = time.perf_counter()
+
+                        if proximo_instante_frame < agora:
+                            proximo_instante_frame = (
+                                agora + intervalo_frame
+                            )
+
+            # ---------------------------------------------
+            # VERIFICA SE AS JANELAS CONTINUAM ABERTAS
+            # ---------------------------------------------
 
             try:
                 if (
                     cv2.getWindowProperty(
-                        nome_janela,
+                        NOME_JANELA_REPLAY,
                         cv2.WND_PROP_VISIBLE,
                     ) < 1
                 ):
                     break
-
             except cv2.error:
                 break
 
     finally:
-        captura_replay.release()
+        for captura in capturas.values():
+            captura.release()
 
         try:
-            cv2.destroyWindow(nome_janela)
-
+            cv2.destroyWindow(NOME_JANELA_REPLAY)
         except cv2.error:
             pass
+
+
+# =========================================================
+# GRADE DE CÂMERAS AO VIVO
+# =========================================================
+
+def criar_painel_camera(captura, indice_camera):
+    largura = LARGURA_PAINEL_CAMERA
+    altura_cabecalho = ALTURA_CABECALHO_CAMERA
+    altura_imagem = ALTURA_IMAGEM_CAMERA
+
+    painel = np.zeros(
+        (
+            altura_cabecalho + altura_imagem,
+            largura,
+            3,
+        ),
+        dtype=np.uint8,
+    )
+
+    cv2.rectangle(
+        painel,
+        (0, 0),
+        (largura, altura_cabecalho),
+        (32, 38, 48),
+        -1,
+    )
+
+    if captura is None:
+        titulo = f"CAMERA {indice_camera + 1}"
+        status = "NAO DISPONIVEL"
+
+        cv2.putText(
+            painel,
+            titulo,
+            (14, 27),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (230, 230, 230),
+            2,
+            cv2.LINE_AA,
+        )
+
+        tamanho_status = cv2.getTextSize(
+            status,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            1,
+        )[0]
+
+        cv2.putText(
+            painel,
+            status,
+            (largura - tamanho_status[0] - 12, 26),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (80, 160, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        mensagem = "Conecte a webcam e reinicie o programa."
+
+        tamanho_mensagem = cv2.getTextSize(
+            mensagem,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            1,
+        )[0]
+
+        cv2.putText(
+            painel,
+            mensagem,
+            (
+                max(10, (largura - tamanho_mensagem[0]) // 2),
+                altura_cabecalho + altura_imagem // 2,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (180, 190, 205),
+            1,
+            cv2.LINE_AA,
+        )
+
+        return painel
+
+    frame = captura.obter_frame()
+
+    cv2.putText(
+        painel,
+        captura.nome_camera.upper(),
+        (14, 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (240, 240, 240),
+        2,
+        cv2.LINE_AA,
+    )
+
+    if frame is None:
+        status = "AGUARDANDO IMAGEM"
+        cor_status = (0, 190, 255)
+    else:
+        status = "AO VIVO"
+        cor_status = (80, 220, 120)
+
+    tamanho_status = cv2.getTextSize(
+        status,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        1,
+    )[0]
+
+    cv2.putText(
+        painel,
+        status,
+        (largura - tamanho_status[0] - 12, 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        cor_status,
+        1,
+        cv2.LINE_AA,
+    )
+
+    if frame is None:
+        mensagem = "Aguardando a primeira imagem..."
+
+        tamanho_mensagem = cv2.getTextSize(
+            mensagem,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            1,
+        )[0]
+
+        cv2.putText(
+            painel,
+            mensagem,
+            (
+                max(10, (largura - tamanho_mensagem[0]) // 2),
+                altura_cabecalho + altura_imagem // 2,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (180, 190, 205),
+            1,
+            cv2.LINE_AA,
+        )
+
+        return painel
+
+    altura_frame, largura_frame = frame.shape[:2]
+
+    escala = min(
+        largura / largura_frame,
+        altura_imagem / altura_frame,
+    )
+
+    nova_largura = max(1, int(largura_frame * escala))
+    nova_altura = max(1, int(altura_frame * escala))
+
+    frame_redimensionado = cv2.resize(
+        frame,
+        (nova_largura, nova_altura),
+        interpolation=cv2.INTER_AREA,
+    )
+
+    x = (largura - nova_largura) // 2
+    y = altura_cabecalho + (
+        altura_imagem - nova_altura
+    ) // 2
+
+    painel[
+        y:y + nova_altura,
+        x:x + nova_largura,
+    ] = frame_redimensionado
+
+    return painel
+
+
+def montar_grade_ao_vivo(capturas, salvando=False):
+    painel_camera_1 = criar_painel_camera(
+        capturas.get(0),
+        0,
+    )
+
+    painel_camera_2 = criar_painel_camera(
+        capturas.get(1),
+        1,
+    )
+
+    espacamento = 12
+    margem = 12
+
+    altura_paineis = (
+        ALTURA_CABECALHO_CAMERA + ALTURA_IMAGEM_CAMERA
+    )
+
+    largura_total = (
+        margem * 2
+        + LARGURA_PAINEL_CAMERA * 2
+        + espacamento
+    )
+
+    altura_total = margem * 2 + altura_paineis + 76
+
+    tela = np.zeros(
+        (altura_total, largura_total, 3),
+        dtype=np.uint8,
+    )
+    tela[:] = (20, 24, 31)
+
+    x1 = margem
+    x2 = margem + LARGURA_PAINEL_CAMERA + espacamento
+    y_paineis = margem
+
+    tela[
+        y_paineis:y_paineis + altura_paineis,
+        x1:x1 + LARGURA_PAINEL_CAMERA,
+    ] = painel_camera_1
+
+    tela[
+        y_paineis:y_paineis + altura_paineis,
+        x2:x2 + LARGURA_PAINEL_CAMERA,
+    ] = painel_camera_2
+
+    y_texto = y_paineis + altura_paineis + 28
+
+    texto = (
+        "SALVANDO OS DOIS ANGULOS..."
+        if salvando
+        else "ESPACO: salvar os ultimos 30 segundos das cameras"
+    )
+
+    cor = (0, 165, 255) if salvando else (225, 230, 238)
+
+    cv2.putText(
+        tela,
+        texto,
+        (margem, y_texto),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        cor,
+        1,
+        cv2.LINE_AA,
+    )
+
+    cv2.putText(
+        tela,
+        "ESC: encerrar o programa",
+        (margem, y_texto + 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        (170, 185, 205),
+        1,
+        cv2.LINE_AA,
+    )
+
+    return tela
 
 
 # =========================================================
@@ -933,114 +1483,78 @@ def visualizar_replay(caminho_arquivo):
 # =========================================================
 
 def main():
-    captura = CapturaWebcam(indice_camera=0)
     salvador = SalvadorReplay()
+    capturas = {}
 
-    if not captura.iniciar():
-        print(captura.erro)
+    print("\n" + "=" * 54)
+    print("INICIALIZANDO CAMERAS DO VAR FUTEVOLEI")
+    print("=" * 54)
+
+    for indice in (0, 1):
+        captura_camera = CapturaWebcam(
+            indice_camera=indice,
+            nome_camera=f"Câmera {indice + 1}",
+        )
+
+        print(
+            f"Tentando abrir a Câmera {indice + 1} "
+            f"(índice {indice})..."
+        )
+
+        if captura_camera.iniciar():
+            capturas[indice] = captura_camera
+            print(f"Câmera {indice + 1} iniciada com sucesso.")
+        else:
+            print(captura_camera.erro)
+
+    if not capturas:
+        print("\nNenhuma webcam foi encontrada.")
+        print("Verifique a conexão e tente novamente.")
         return
 
-    nome_janela = "VAR Futevolei"
-
-    cv2.namedWindow(
-        nome_janela,
-        cv2.WINDOW_NORMAL,
-    )
+    cv2.namedWindow(NOME_JANELA_AO_VIVO, cv2.WINDOW_NORMAL)
 
     cv2.resizeWindow(
-        nome_janela,
-        1100,
-        650,
+        NOME_JANELA_AO_VIVO,
+        LARGURA_JANELA_AO_VIVO,
+        ALTURA_JANELA_AO_VIVO,
     )
 
-    print("\n" + "=" * 48)
+    print("\n" + "=" * 54)
     print("VAR FUTEVOLEI INICIADO")
-    print("=" * 48)
-    print("Aguarde o buffer acumular os primeiros segundos.")
-    print("ESPACO: salvar e abrir os últimos 30 segundos.")
+    print("=" * 54)
+    print("As câmeras estão sendo exibidas lado a lado.")
+    print("Cada câmera possui seu próprio buffer de 30 segundos.")
+    print("ESPAÇO: salvar e abrir o replay dos ângulos disponíveis.")
     print("ESC: encerrar o programa.")
-    print("=" * 48 + "\n")
+    print("=" * 54 + "\n")
 
     executando = True
 
     try:
         while executando:
-            # Abre automaticamente o replay após o salvamento.
-            replay_pronto = salvador.obter_replay_pronto()
+            resultado_replay = salvador.obter_replay_pronto()
 
-            if replay_pronto is not None:
-                visualizar_replay(replay_pronto)
-                continue
-
-            frame = captura.obter_frame()
-
-            if frame is None:
-                if captura.erro:
-                    print(captura.erro)
-                    break
-
-                cv2.waitKey(10)
-                continue
-
-            duracao, quantidade, memoria_mb = (
-                captura.obter_status_buffer()
-            )
-
-            texto = (
-                f"AO VIVO | Buffer: "
-                f"{duracao:.1f}/{DURACAO_BUFFER}s"
-                f" | Quadros: {quantidade}"
-                f" | Memoria: {memoria_mb:.1f} MB"
-            )
-
-            tela = frame.copy()
-
-            cv2.rectangle(
-                tela,
-                (0, 0),
-                (tela.shape[1], 45),
-                (25, 25, 25),
-                -1,
-            )
-
-            cv2.putText(
-                tela,
-                texto,
-                (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-
-            if salvador.esta_salvando():
-                texto_salvamento = "SALVANDO REPLAY..."
-
-                tamanho_texto = cv2.getTextSize(
-                    texto_salvamento,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    2,
-                )[0]
-
-                posicao_x = max(
-                    15,
-                    tela.shape[1] - tamanho_texto[0] - 20,
+            if resultado_replay is not None:
+                # A janela ao vivo não é fechada nem recriada.
+                # O visualizador atualiza sua imagem enquanto
+                # o replay está aberto.
+                visualizar_replay(
+                    resultado_replay,
+                    capturas_ao_vivo=capturas,
+                    nome_janela_ao_vivo=NOME_JANELA_AO_VIVO,
+                    salvador=salvador,
                 )
 
-                cv2.putText(
-                    tela,
-                    texto_salvamento,
-                    (posicao_x, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 165, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
+                # Ao sair do replay, o loop principal continua.
+                continue
 
-            cv2.imshow(nome_janela, tela)
+            tela = montar_grade_ao_vivo(
+                capturas,
+                salvador.esta_salvando(),
+            )
+
+            cv2.imshow(NOME_JANELA_AO_VIVO, tela)
 
             tecla = cv2.waitKey(1) & 0xFF
 
@@ -1048,13 +1562,29 @@ def main():
                 executando = False
 
             elif tecla == 32:
-                clipe = captura.obter_replay()
-                salvador.iniciar(clipe)
+                clipes = {
+                    indice: captura.obter_replay()
+                    for indice, captura in capturas.items()
+                }
+
+                clipes = {
+                    indice: clipe
+                    for indice, clipe in clipes.items()
+                    if clipe
+                }
+
+                if not clipes:
+                    print(
+                        "As câmeras ainda não possuem "
+                        "quadros para salvar."
+                    )
+                else:
+                    salvador.iniciar(clipes)
 
             try:
                 if (
                     cv2.getWindowProperty(
-                        nome_janela,
+                        NOME_JANELA_AO_VIVO,
                         cv2.WND_PROP_VISIBLE,
                     ) < 1
                 ):
@@ -1067,9 +1597,12 @@ def main():
         print("\nEncerrando o programa...")
 
     finally:
-        captura.parar()
+        for captura_camera in capturas.values():
+            captura_camera.parar()
+
         salvador.aguardar()
         cv2.destroyAllWindows()
+
         print("VAR Futevolei encerrado.")
 
 
